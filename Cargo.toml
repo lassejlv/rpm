@@ -1,0 +1,26 @@
+[package]
+name = "rpm"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rpm"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.41", features = ["full", "process"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+flate2 = "1.0"
+tar = "0.4"
+futures = "0.3"
+anyhow = "1.0"
+bytes = "1.6"
+semver = "1.0"
+async-recursion = "1.0"
+dashmap = "6.0"
+indicatif = "0.17"
+clap = { version = "4.4", features = ["derive"] }
+uuid = { version = "1.0", features = ["v4"] }
+fs_extra = "1.3"

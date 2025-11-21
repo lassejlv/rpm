@@ -1,0 +1,429 @@
+use crate::installer::Installer;
+use crate::registry::Registry;
+use crate::types::{LockFile, LockPackage, PackageJson};
+use anyhow::{Context, Result};
+use dashmap::DashMap;
+use futures::stream::{FuturesUnordered, StreamExt};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::fs;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::Semaphore;
+use tokio::process::Command;
+
+#[derive(Clone)]
+pub struct Manager {
+    registry: Registry,
+    installer: Installer,
+    installed: Arc<DashMap<String, String>>,
+    semaphore: Arc<Semaphore>,
+    multi_progress: MultiProgress,
+    lockfile: Arc<tokio::sync::Mutex<LockFile>>,
+    postinstalls: Arc<DashMap<String, (PathBuf, String)>>,
+    auto_confirm: bool,
+}
+
+impl Manager {
+    pub fn new(force_no_cache: bool, auto_confirm: bool) -> Self {
+        Self {
+            registry: Registry::new(),
+            installer: Installer::new(force_no_cache),
+            installed: Arc::new(DashMap::new()),
+            semaphore: Arc::new(Semaphore::new(50)), // Limit concurrency
+            multi_progress: MultiProgress::new(),
+            lockfile: Arc::new(tokio::sync::Mutex::new(LockFile {
+                name: "".to_string(),
+                version: "".to_string(),
+                lockfile_version: 3,
+                packages: BTreeMap::new(),
+            })),
+            postinstalls: Arc::new(DashMap::new()),
+            auto_confirm,
+        }
+    }
+
+    async fn load_lockfile(&self) -> Result<()> {
+        if let Ok(content) = fs::read_to_string("rpm-lock.json").await {
+            let lock: LockFile = serde_json::from_str(&content).unwrap_or_else(|_| LockFile {
+                name: "".to_string(),
+                version: "".to_string(),
+                lockfile_version: 3,
+                packages: BTreeMap::new(),
+            });
+            *self.lockfile.lock().await = lock;
+        }
+        Ok(())
+    }
+
+    async fn save_lockfile(&self, package_name: &str, package_version: &str) -> Result<()> {
+        let mut lock = self.lockfile.lock().await;
+        lock.name = package_name.to_string();
+        lock.version = package_version.to_string();
+        let content = serde_json::to_string_pretty(&*lock)?;
+        fs::write("rpm-lock.json", content).await?;
+        Ok(())
+    }
+
+    pub async fn handle_cache_command(&self, command: crate::CacheCommands) -> Result<()> {
+        match command {
+            crate::CacheCommands::Clean => {
+                if self.installer.cache_dir.exists() {
+                    fs::remove_dir_all(&self.installer.cache_dir).await?;
+                    println!("\x1b[32mCache cleaned successfully.\x1b[0m");
+                } else {
+                    println!("\x1b[33mCache is already empty.\x1b[0m");
+                }
+            }
+            crate::CacheCommands::Info => {
+                let path = &self.installer.cache_dir;
+                println!("\x1b[1mCache location:\x1b[0m {}", path.display());
+                
+                if path.exists() {
+                    let size = fs_extra::dir::get_size(path).unwrap_or(0);
+                    println!("\x1b[1mCache size:\x1b[0m {:.2} MB", size as f64 / 1024.0 / 1024.0);
+                    
+                    let count = std::fs::read_dir(path)?.count();
+                    println!("\x1b[1mCached packages:\x1b[0m {}", count);
+                } else {
+                    println!("\x1b[1mCache size:\x1b[0m 0 MB");
+                    println!("\x1b[1mCached packages:\x1b[0m 0");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn add_packages(&self, packages: Vec<String>) -> Result<()> {
+        self.load_lockfile().await?;
+        let package_json_content = fs::read_to_string("package.json").await?;
+        let mut package_json: PackageJson = serde_json::from_str(&package_json_content)?;
+        
+        let spinner = self.multi_progress.add(ProgressBar::new_spinner());
+        spinner.set_style(ProgressStyle::default_spinner().template("{spinner:.cyan} {msg}").unwrap());
+        spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+
+        for pkg_input in packages {
+            let (name, range) = if let Some(idx) = pkg_input.rfind('@') {
+                if idx == 0 {
+                    (pkg_input.as_str(), "latest")
+                } else {
+                    (&pkg_input[..idx], &pkg_input[idx + 1..])
+                }
+            } else {
+                (pkg_input.as_str(), "latest")
+            };
+
+            spinner.set_message(format!("Resolving {}...", name));
+            let package = self.registry.get_package(name).await
+                .with_context(|| format!("Failed to fetch metadata for {}", name))?;
+            let resolved = self.registry.resolve_version(&package, range)
+                .with_context(|| format!("Failed to resolve version for {}", name))?;
+            
+            package_json.dependencies.insert(name.to_string(), format!("^{}", resolved.version));
+            let _ = self.multi_progress.println(format!("\x1b[32m+\x1b[0m {}@{}", name, resolved.version));
+        }
+        spinner.finish_and_clear();
+
+        let new_content = serde_json::to_string_pretty(&package_json)?;
+        fs::write("package.json", new_content).await?;
+        
+        self.install_deps(&package_json).await?;
+        self.run_postinstalls().await?;
+        self.save_lockfile(&package_json.name, &package_json.version).await?;
+        Ok(())
+    }
+
+    pub async fn install(&self) -> Result<()> {
+        self.load_lockfile().await?;
+        let package_json_content = fs::read_to_string("package.json").await?;
+        let package_json: PackageJson = serde_json::from_str(&package_json_content)?;
+        
+        // Main spinner for overall progress
+        let pb = self.multi_progress.add(ProgressBar::new(0));
+        pb.set_style(ProgressStyle::default_spinner()
+            .template("{spinner:.cyan} Installing dependencies...")
+            .unwrap());
+        pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+        self.install_deps(&package_json).await?;
+        pb.finish_and_clear();
+
+        self.run_postinstalls().await?;
+        self.save_lockfile(&package_json.name, &package_json.version).await?;
+        
+        Ok(())
+    }
+
+    async fn install_deps(&self, package_json: &PackageJson) -> Result<()> {
+        let root = std::env::current_dir()?;
+        let mut tasks = FuturesUnordered::new();
+
+        for (name, version) in &package_json.dependencies {
+            let root = root.clone();
+            let name = name.clone();
+            let version = version.clone();
+            let manager = self.clone();
+            tasks.push(async move {
+                manager.resolve_and_install(name, version, root).await
+            });
+        }
+
+        while let Some(result) = tasks.next().await {
+             if let Err(e) = result {
+                let _ = self.multi_progress.println(format!("\x1b[31mError:\x1b[0m {}", e));
+            }
+        }
+        Ok(())
+    }
+
+    async fn run_postinstalls(&self) -> Result<()> {
+        if self.postinstalls.is_empty() {
+            return Ok(());
+        }
+
+        let scripts_to_run: Vec<_> = if !self.auto_confirm {
+            println!("\n\x1b[1mPending postinstall scripts:\x1b[0m");
+            for entry in self.postinstalls.iter() {
+                println!(" - \x1b[36m{}\x1b[0m: \x1b[90m{}\x1b[0m", entry.key(), entry.value().1);
+            }
+            
+            println!("\n\x1b[1mDo you want to run these scripts? [y/N]\x1b[0m");
+            
+            let mut stdin = BufReader::new(tokio::io::stdin());
+            let mut line = String::new();
+            stdin.read_line(&mut line).await?;
+            
+            if line.trim().eq_ignore_ascii_case("y") {
+                self.postinstalls.iter().map(|e| (e.key().clone(), e.value().clone())).collect()
+            } else {
+                println!("\x1b[33mSkipping postinstall scripts.\x1b[0m");
+                return Ok(());
+            }
+        } else {
+            self.postinstalls.iter().map(|e| (e.key().clone(), e.value().clone())).collect()
+        };
+
+        if scripts_to_run.is_empty() {
+            return Ok(());
+        }
+
+        let pb = self.multi_progress.add(ProgressBar::new(scripts_to_run.len() as u64));
+        pb.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.cyan} [{bar:40.cyan/blue}] {pos}/{len} Running postinstall scripts...")
+            .unwrap()
+            .progress_chars("#>-"));
+
+        for (name, (path, script)) in scripts_to_run {
+             pb.set_message(format!("Running postinstall for {}", name));
+             
+             let status = Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .current_dir(&path)
+                .status()
+                .await;
+                
+             if status.is_err() && cfg!(windows) {
+                 let _ = Command::new("cmd")
+                    .arg("/C")
+                    .arg(&script)
+                    .current_dir(&path)
+                    .status()
+                    .await;
+             }
+             
+             pb.inc(1);
+        }
+        
+        pb.finish_and_clear();
+        Ok(())
+    }
+
+    async fn link_binaries(&self, target_dir: &PathBuf, package_name: &str, bin: &serde_json::Value) -> Result<()> {
+        let bin_dir = target_dir.join("node_modules").join(".bin");
+        fs::create_dir_all(&bin_dir).await?;
+
+        let bins: BTreeMap<String, String> = match bin {
+            serde_json::Value::String(s) => {
+                let mut map = BTreeMap::new();
+                map.insert(package_name.to_string(), s.clone());
+                map
+            },
+            serde_json::Value::Object(o) => {
+                let mut map = BTreeMap::new();
+                for (k, v) in o {
+                    if let Some(s) = v.as_str() {
+                        map.insert(k.clone(), s.to_string());
+                    }
+                }
+                map
+            },
+            _ => BTreeMap::new(),
+        };
+
+        for (name, path) in bins {
+            let target_path = target_dir.join("node_modules").join(package_name).join(&path);
+            let link_path = bin_dir.join(&name);
+
+            #[cfg(unix)]
+            {
+                // Relative path from .bin to target file
+                // .bin/tool -> ../package/cli.js
+                let relative = PathBuf::from("..").join(package_name).join(&path);
+                if link_path.exists() || link_path.is_symlink() {
+                    let _ = fs::remove_file(&link_path).await;
+                }
+                
+                // This needs to be spawned blocking if using std::fs, but we can use tokio::fs::symlink
+                let _ = fs::symlink(&relative, &link_path).await;
+                
+                // Make executable
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(metadata) = fs::metadata(&target_path).await {
+                    let mut perms = metadata.permissions();
+                    perms.set_mode(0o755);
+                    let _ = fs::set_permissions(&target_path, perms).await;
+                }
+            }
+
+            #[cfg(windows)]
+            {
+                let cmd_content = format!(
+                    "@ECHO off\r\n\"%~dp0\\..\\{}\\{}\" %*\r\n",
+                    package_name, path.replace("/", "\\")
+                );
+                fs::write(link_path.with_extension("cmd"), cmd_content).await?;
+                
+                // Optional: Powershell shim
+                let ps1_content = format!(
+                    "& \"$PSScriptRoot\\..\\{}\\{}\" $args\r\n",
+                    package_name, path.replace("/", "\\")
+                );
+                fs::write(link_path.with_extension("ps1"), ps1_content).await?;
+            }
+        }
+        Ok(())
+    }
+
+    #[async_recursion::async_recursion]
+    async fn resolve_and_install(&self, name: String, version_range: String, target_dir: PathBuf) -> Result<()> {
+        if self.installed.contains_key(&name) {
+            return Ok(());
+        }
+        
+        let lock_entry = {
+            let lock = self.lockfile.lock().await;
+            let key = format!("node_modules/{}", name);
+            lock.packages.get(&key).cloned()
+        };
+
+        let (version, tarball, deps, postinstall, bin) = if let Some(entry) = lock_entry {
+             let matches = semver::Version::parse(&entry.version)
+                .ok()
+                .and_then(|v| semver::VersionReq::parse(&version_range).ok().map(|r| r.matches(&v)))
+                .unwrap_or(false);
+
+             if matches || version_range == entry.version {
+                 (entry.version, entry.resolved, entry.dependencies, entry.postinstall, entry.bin)
+             } else {
+                 self.fetch_and_resolve(&name, &version_range).await?
+             }
+        } else {
+            self.fetch_and_resolve(&name, &version_range).await?
+        };
+        
+        if self.installed.contains_key(&name) {
+            return Ok(());
+        }
+        self.installed.insert(name.clone(), version.clone());
+
+        let install_path = target_dir.join("node_modules").join(&name);
+        let already_exists = install_path.join("package.json").exists();
+
+        if !already_exists {
+            // Create a temporary spinner for this package download
+            let pb = self.multi_progress.add(ProgressBar::new(0));
+            pb.set_style(ProgressStyle::default_spinner()
+                .template("{spinner:.cyan} {msg}")
+                .unwrap()
+                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"));
+            pb.enable_steady_tick(std::time::Duration::from_millis(100));
+            pb.set_message(format!("checking cache {}@{}...", name, version));
+
+            let install_res = async {
+                 let install_dir = std::env::current_dir().unwrap();
+                 self.installer.install_package(&name, &version, &tarball, &install_dir).await
+            }.await;
+            
+            match install_res {
+                Ok(_) => {
+                    // Success! Clear the spinner
+                    pb.finish_and_clear(); 
+                    
+                    // Collect postinstall if exists
+                    if let Some(script) = &postinstall {
+                        self.postinstalls.insert(name.clone(), (install_path.clone(), script.clone()));
+                    }
+                }
+                Err(e) => {
+                    pb.finish_with_message(format!("\x1b[31mx\x1b[0m {} failed: {}", name, e));
+                    return Err(e);
+                }
+            }
+        }
+
+        // Always try to link binaries if they exist
+        if let Some(bin_val) = &bin {
+            let _ = self.link_binaries(&target_dir, &name, bin_val).await;
+        }
+
+        {
+            let mut lock = self.lockfile.lock().await;
+            let key = format!("node_modules/{}", name);
+            lock.packages.insert(key, LockPackage {
+                version: version.clone(),
+                resolved: tarball.clone(),
+                integrity: None,
+                dependencies: deps.clone(),
+                postinstall: postinstall.clone(),
+                bin: bin.clone(),
+            });
+        }
+
+        let mut tasks = FuturesUnordered::new();
+        for (dep_name, dep_ver) in deps {
+            let dep_name = dep_name.clone();
+            let dep_ver = dep_ver.clone();
+            let target_dir = target_dir.clone();
+            let manager = self.clone();
+            tasks.push(async move {
+                manager.resolve_and_install(dep_name, dep_ver, target_dir).await
+            });
+        }
+
+        while let Some(result) = tasks.next().await {
+            if let Err(e) = result {
+                let _ = self.multi_progress.println(format!("\x1b[33mWarning sub-dep {}:\x1b[0m {}", name, e));
+            }
+        }
+        Ok(())
+    }
+
+    async fn fetch_and_resolve(&self, name: &str, range: &str) -> Result<(String, String, BTreeMap<String, String>, Option<String>, Option<serde_json::Value>)> {
+        let _permit = self.semaphore.acquire().await?;
+        let package = self.registry.get_package(name).await?;
+        let resolved = self.registry.resolve_version(&package, range)?;
+        
+        let postinstall = resolved.scripts.get("postinstall").or(resolved.scripts.get("install")).cloned();
+        
+        Ok((
+            resolved.version.clone(), 
+            resolved.dist.tarball.clone(), 
+            resolved.dependencies.clone(),
+            postinstall,
+            resolved.bin.clone(),
+        ))
+    }
+}
