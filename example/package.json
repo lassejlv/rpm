@@ -1,0 +1,23 @@
+{
+  "name": "example-folder",
+  "version": "101",
+  "dependencies": {
+    "@hono/zod-validator": "^0.7.6",
+    "driftsql": "^2.0.6-beta",
+    "drizzle-orm": "^1.0.0-beta.8-734e789",
+    "electron": "^39.2.7",
+    "hono": "^4.11.3",
+    "prettier": "^3.7.4",
+    "zod": "^4.3.5"
+  },
+  "dev_dependencies": {
+    "drizzle-kit": "^1.0.0-beta.8-734e789"
+  },
+  "scripts": {
+    "test": "echo \"Running tests...\"",
+    "build": "echo \"Building project...\"",
+    "dev": "echo \"Starting dev server...\"",
+    "fmt": "prettier --help"
+  },
+  "bin": null
+}

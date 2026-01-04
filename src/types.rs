@@ -1,10 +1,23 @@
-use std::collections::{BTreeMap, HashMap};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use std::collections::{BTreeMap, HashMap};
+
+fn default_version() -> String {
+    "0.0.0".to_string()
+}
+
+fn deserialize_version<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_else(default_version))
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct PackageJson {
     pub name: String,
+    #[serde(default = "default_version", deserialize_with = "deserialize_version")]
     pub version: String,
     #[serde(default)]
     pub dependencies: BTreeMap<String, String>,
