@@ -93,6 +93,7 @@ These options can be used with any command:
 |--------|-------------|
 | `--force-no-cache` | Force download and ignore cache |
 | `--yes` | Skip postinstall script confirmation |
+| `--ignore-scripts` | Skip postinstall scripts entirely |
 | `-h, --help` | Print help information |
 | `-V, --version` | Print version |
 

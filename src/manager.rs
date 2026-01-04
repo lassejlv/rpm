@@ -23,10 +23,11 @@ pub struct Manager {
     lockfile: Arc<tokio::sync::Mutex<LockFile>>,
     postinstalls: Arc<DashMap<String, (PathBuf, String)>>,
     auto_confirm: bool,
+    ignore_scripts: bool,
 }
 
 impl Manager {
-    pub fn new(force_no_cache: bool, auto_confirm: bool) -> Self {
+    pub fn new(force_no_cache: bool, auto_confirm: bool, ignore_scripts: bool) -> Self {
         Self {
             registry: Registry::new(),
             installer: Installer::new(force_no_cache),
@@ -41,6 +42,7 @@ impl Manager {
             })),
             postinstalls: Arc::new(DashMap::new()),
             auto_confirm,
+            ignore_scripts,
         }
     }
 
@@ -330,7 +332,7 @@ impl Manager {
     }
 
     async fn run_postinstalls(&self) -> Result<()> {
-        if self.postinstalls.is_empty() {
+        if self.postinstalls.is_empty() || self.ignore_scripts {
             return Ok(());
         }
 

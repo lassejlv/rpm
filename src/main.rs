@@ -22,6 +22,10 @@ struct Cli {
     /// Skip postinstall confirmation
     #[arg(long, global = true)]
     yes: bool,
+
+    /// Skip postinstall scripts entirely
+    #[arg(long, global = true)]
+    ignore_scripts: bool,
 }
 
 #[derive(Subcommand)]
@@ -78,7 +82,7 @@ enum CacheCommands {
 async fn main() {
     let start = Instant::now();
     let cli = Cli::parse();
-    let manager = Manager::new(cli.force_no_cache, cli.yes);
+    let manager = Manager::new(cli.force_no_cache, cli.yes, cli.ignore_scripts);
 
     println!(
         "\x1b[1;36mrpm\x1b[0m \x1b[90mv{}\x1b[0m\n",
