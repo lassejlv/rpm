@@ -63,6 +63,16 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Execute a package binary (like npx)
+    #[command(visible_alias = "exec")]
+    X {
+        /// Package to execute (e.g. prettier, eslint@8.0.0)
+        package: String,
+
+        /// Arguments to pass to the package
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Manage package cache
     Cache {
         #[command(subcommand)]
@@ -93,6 +103,7 @@ async fn main() {
         Some(Commands::Add { packages, dev }) => manager.add_packages(packages, dev).await,
         Some(Commands::Remove { packages }) => manager.remove_packages(packages).await,
         Some(Commands::Run { script, args }) => manager.run_script(&script, args).await,
+        Some(Commands::X { package, args }) => manager.exec_package(&package, args).await,
         Some(Commands::Cache { command }) => manager.handle_cache_command(command).await,
         Some(Commands::Install) | None => manager.install().await,
     };

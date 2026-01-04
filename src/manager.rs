@@ -231,6 +231,165 @@ impl Manager {
         Ok(())
     }
 
+    pub async fn exec_package(&self, package: &str, args: Vec<String>) -> Result<()> {
+        // Parse package name and version
+        let (name, version_range) = if let Some(idx) = package.rfind('@') {
+            if idx == 0 {
+                (package, "latest")
+            } else {
+                (&package[..idx], &package[idx + 1..])
+            }
+        } else {
+            (package, "latest")
+        };
+
+        // Extract the binary name (last part of scoped package or package name)
+        let bin_name = if name.starts_with('@') {
+            name.split('/').last().unwrap_or(name)
+        } else {
+            name
+        };
+
+        // First, check if binary exists locally in node_modules/.bin
+        let local_bin = PathBuf::from("node_modules").join(".bin").join(bin_name);
+        if local_bin.exists() {
+            println!("\x1b[90mUsing local\x1b[0m \x1b[1m{}\x1b[0m\n", bin_name);
+            return self.run_binary(&local_bin, args).await;
+        }
+
+        // Not found locally, need to fetch and run
+        let spinner = self.multi_progress.add(ProgressBar::new_spinner());
+        spinner.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.cyan} {msg}")
+                .unwrap()
+                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+        );
+        spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+        spinner.set_message(format!("\x1b[1mFetching\x1b[0m {}...", name));
+
+        // Fetch package metadata
+        let pkg = self
+            .registry
+            .get_package(name)
+            .await
+            .with_context(|| format!("Failed to fetch package {}", name))?;
+        let resolved = self
+            .registry
+            .resolve_version(&pkg, version_range)
+            .with_context(|| format!("Failed to resolve version for {}", name))?;
+
+        spinner.set_message(format!(
+            "\x1b[1mInstalling\x1b[0m {}@{}...",
+            name, resolved.version
+        ));
+
+        // Install to a temporary location within the cache
+        let temp_dir = self.installer.cache_dir.join("_npx").join(format!(
+            "{}@{}",
+            name.replace('/', "+"),
+            resolved.version
+        ));
+
+        // Install the main package
+        self.installer
+            .install_package(name, &resolved.version, &resolved.dist.tarball, &temp_dir)
+            .await?;
+
+        // Install dependencies recursively
+        spinner.set_message(format!(
+            "\x1b[1mInstalling\x1b[0m dependencies for {}...",
+            name
+        ));
+
+        let mut to_install: Vec<(String, String)> = resolved
+            .dependencies
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        while let Some((dep_name, dep_version)) = to_install.pop() {
+            let dep_install_path = temp_dir.join("node_modules").join(&dep_name);
+            if dep_install_path.exists() {
+                continue;
+            }
+
+            if let Ok(dep_pkg) = self.registry.get_package(&dep_name).await {
+                if let Ok(dep_resolved) = self.registry.resolve_version(&dep_pkg, &dep_version) {
+                    let _ = self
+                        .installer
+                        .install_package(
+                            &dep_name,
+                            &dep_resolved.version,
+                            &dep_resolved.dist.tarball,
+                            &temp_dir,
+                        )
+                        .await;
+
+                    // Add transitive dependencies
+                    for (k, v) in &dep_resolved.dependencies {
+                        let nested_path = temp_dir.join("node_modules").join(k);
+                        if !nested_path.exists() {
+                            to_install.push((k.clone(), v.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        spinner.finish_and_clear();
+
+        // Find the binary
+        let bin_path = if let Some(bin) = &resolved.bin {
+            match bin {
+                serde_json::Value::String(s) => temp_dir.join("node_modules").join(name).join(s),
+                serde_json::Value::Object(o) => {
+                    if let Some(serde_json::Value::String(s)) = o.get(bin_name) {
+                        temp_dir.join("node_modules").join(name).join(s)
+                    } else if let Some((_, serde_json::Value::String(s))) = o.iter().next() {
+                        temp_dir.join("node_modules").join(name).join(s)
+                    } else {
+                        anyhow::bail!("No binary found in package {}", name);
+                    }
+                }
+                _ => anyhow::bail!("No binary found in package {}", name),
+            }
+        } else {
+            anyhow::bail!("Package {} does not have a binary", name);
+        };
+
+        if !bin_path.exists() {
+            anyhow::bail!("Binary not found at {}", bin_path.display());
+        }
+
+        println!(
+            "\x1b[90mExecuting\x1b[0m \x1b[1m{}@{}\x1b[0m\n",
+            name, resolved.version
+        );
+
+        self.run_binary(&bin_path, args).await
+    }
+
+    async fn run_binary(&self, bin_path: &PathBuf, args: Vec<String>) -> Result<()> {
+        let current_dir = std::env::current_dir()?;
+        let local_bin_path = current_dir.join("node_modules").join(".bin");
+        let path_env = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{}", local_bin_path.display(), path_env);
+
+        let status = Command::new("node")
+            .arg(bin_path)
+            .args(&args)
+            .env("PATH", &new_path)
+            .status()
+            .await?;
+
+        if !status.success() {
+            std::process::exit(status.code().unwrap_or(1));
+        }
+
+        Ok(())
+    }
+
     pub async fn run_script(&self, script_name: &str, args: Vec<String>) -> Result<()> {
         let package_json_content = fs::read_to_string("package.json").await?;
         let package_json: PackageJson = serde_json::from_str(&package_json_content)?;

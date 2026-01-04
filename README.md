@@ -73,6 +73,26 @@ rpm run dev
 rpm run test -- --watch --coverage
 ```
 
+### Execute Packages (npx alternative)
+
+Execute a package binary without installing it permanently:
+
+```bash
+# Execute a package
+rpm x cowsay hello
+
+# Execute a specific version
+rpm x prettier@3.0.0 --check .
+
+# Using the exec alias
+rpm exec eslint .
+
+# Pass arguments
+rpm x typescript -- --init
+```
+
+If the package is already installed locally in `node_modules/.bin`, it will use that version. Otherwise, it will fetch and cache the package temporarily.
+
 ### Cache Management
 
 Manage the global package cache:
@@ -84,6 +104,17 @@ rpm cache info
 # Clear the cache
 rpm cache clean
 ```
+
+## Commands
+
+| Command | Aliases | Description |
+|---------|---------|-------------|
+| `install` | (none) | Install dependencies from package.json |
+| `add` | (none) | Add one or more packages |
+| `remove` | `rm`, `uninstall`, `un` | Remove one or more packages |
+| `run` | (none) | Run a script from package.json |
+| `x` | `exec` | Execute a package binary (like npx) |
+| `cache` | (none) | Manage package cache |
 
 ## Global Options
 
