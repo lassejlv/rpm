@@ -1,4 +1,4 @@
-use anyhow::{Result};
+use anyhow::Result;
 use flate2::read::GzDecoder;
 use reqwest::Client;
 use std::path::{Path, PathBuf};
@@ -18,7 +18,7 @@ impl Installer {
             .or_else(|_| std::env::var("USERPROFILE"))
             .expect("Could not determine home directory");
         let cache_dir = PathBuf::from(home).join(".rpm").join("store");
-        
+
         Self {
             client: Client::new(),
             cache_dir,
@@ -31,22 +31,30 @@ impl Installer {
         self.cache_dir.join(format!("{}@{}", safe_name, version))
     }
 
-    async fn ensure_cache_entry(&self, name: &str, version: &str, tarball_url: &str) -> Result<PathBuf> {
+    async fn ensure_cache_entry(
+        &self,
+        name: &str,
+        version: &str,
+        tarball_url: &str,
+    ) -> Result<PathBuf> {
         let cache_path = self.get_cache_path(name, version);
-        
+
         if !self.force_no_cache && cache_path.exists() {
             return Ok(cache_path);
         }
 
         if self.force_no_cache && cache_path.exists() {
-             fs::remove_dir_all(&cache_path).await?;
+            fs::remove_dir_all(&cache_path).await?;
         }
 
         // Download
         let resp = self.client.get(tarball_url).send().await?;
         let bytes = resp.bytes().await?;
 
-        let temp_dir = self.cache_dir.join("tmp").join(uuid::Uuid::new_v4().to_string());
+        let temp_dir = self
+            .cache_dir
+            .join("tmp")
+            .join(uuid::Uuid::new_v4().to_string());
         fs::create_dir_all(&temp_dir).await?;
 
         let temp_dir_clone = temp_dir.clone();
@@ -54,31 +62,35 @@ impl Installer {
             let tar = GzDecoder::new(&bytes[..]);
             let mut archive = Archive::new(tar);
 
-            archive.entries()?.filter_map(|e| e.ok()).for_each(|mut entry| {
-                let path = entry.path().unwrap();
-                let path_str = path.to_string_lossy();
-                
-                // npm packages are usually inside "package/" folder in tarball
-                let dest_path = if path_str.starts_with("package/") {
-                    temp_dir_clone.join(path_str.trim_start_matches("package/"))
-                } else {
-                    temp_dir_clone.join(path)
-                };
+            archive
+                .entries()?
+                .filter_map(|e| e.ok())
+                .for_each(|mut entry| {
+                    let path = entry.path().unwrap();
+                    let path_str = path.to_string_lossy();
 
-                if let Some(parent) = dest_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let _ = entry.unpack(&dest_path);
-            });
+                    // npm packages are usually inside "package/" folder in tarball
+                    let dest_path = if path_str.starts_with("package/") {
+                        temp_dir_clone.join(path_str.trim_start_matches("package/"))
+                    } else {
+                        temp_dir_clone.join(path)
+                    };
+
+                    if let Some(parent) = dest_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = entry.unpack(&dest_path);
+                });
             Ok(())
-        }).await??;
+        })
+        .await??;
 
         // Move to final cache location
         // Create parent dir if needed
         if let Some(parent) = cache_path.parent() {
             fs::create_dir_all(parent).await?;
         }
-        
+
         // Rename can fail if cross-device, but here we are usually in same home drive
         match fs::rename(&temp_dir, &cache_path).await {
             Ok(_) => Ok(cache_path),
@@ -87,8 +99,8 @@ impl Installer {
                 // But simple rename is best effort
                 // If rename fails (e.g. target exists race condition), we can just return target
                 if cache_path.exists() {
-                     let _ = fs::remove_dir_all(&temp_dir).await;
-                     Ok(cache_path)
+                    let _ = fs::remove_dir_all(&temp_dir).await;
+                    Ok(cache_path)
                 } else {
                     anyhow::bail!("Failed to move cache entry")
                 }
@@ -96,7 +108,13 @@ impl Installer {
         }
     }
 
-    pub async fn install_package(&self, name: &str, version: &str, tarball_url: &str, target_dir: &Path) -> Result<()> {
+    pub async fn install_package(
+        &self,
+        name: &str,
+        version: &str,
+        tarball_url: &str,
+        target_dir: &Path,
+    ) -> Result<()> {
         let cache_path = self.ensure_cache_entry(name, version, tarball_url).await?;
         let install_path = target_dir.join("node_modules").join(name);
 

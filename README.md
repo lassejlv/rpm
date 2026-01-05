@@ -112,6 +112,25 @@ rpm x typescript -- --init
 
 If the package is already installed locally in `node_modules/.bin`, it will use that version. Otherwise, it will fetch and cache the package temporarily.
 
+### List Packages
+
+List all installed packages:
+
+```bash
+rpm list
+
+# Using the alias
+rpm ls
+```
+
+### Why Package
+
+Show why a package is installed (what depends on it):
+
+```bash
+rpm why lodash
+```
+
 ### Cache Management
 
 Manage the global package cache:
@@ -133,6 +152,8 @@ rpm cache clean
 | `remove` | `rm`, `uninstall`, `un` | Remove one or more packages |
 | `run` | (none) | Run a script from package.json |
 | `x` | `exec` | Execute a package binary (like npx) |
+| `list` | `ls` | List installed packages |
+| `why` | (none) | Show why a package is installed |
 | `cache` | (none) | Manage package cache |
 
 ## Global Options

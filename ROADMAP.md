@@ -18,18 +18,18 @@ RPM currently supports:
 ## Short-term Goals
 
 ### Package Management
-- [ ] Peer dependencies support
-- [ ] Optional dependencies support
-- [ ] `npm update` equivalent command
-- [ ] `npm outdated` equivalent command
-- [ ] `npm list` / `npm ls` equivalent command
-- [ ] `npm dedupe` equivalent command
+- [x] Peer dependencies support
+- [x] Optional dependencies support
+- [x] `npm update` equivalent command
+- [x] `npm outdated` equivalent command
+- [x] `npm list` / `npm ls` equivalent command
+- [x] `npm dedupe` equivalent command
 
 ### Versioning
-- [ ] Support for `~` version ranges (patch-level changes)
-- [ ] Support for `^` version ranges (minor-level changes)
-- [ ] Support for `>=`, `<=`, `>`, `<` version constraints
-- [ ] Support for `||` (OR) in version ranges
+- [x] Support for `~` version ranges (patch-level changes)
+- [x] Support for `^` version ranges (minor-level changes)
+- [x] Support for `>=`, `<=`, `>`, `<` version constraints
+- [x] Support for `||` (OR) in version ranges
 - [ ] Git repository dependencies (`git+https://...`)
 - [ ] GitHub shorthand (`user/repo`)
 - [ ] Local file dependencies (`file:../path`)

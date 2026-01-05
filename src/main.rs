@@ -32,6 +32,23 @@ struct Cli {
 enum Commands {
     /// Install dependencies from package.json
     Install,
+    /// List installed packages
+    #[command(visible_alias = "ls")]
+    List,
+    /// Show outdated packages
+    Outdated,
+    /// Update packages to latest versions
+    Update {
+        /// Specific packages to update (updates all if none specified)
+        packages: Vec<String>,
+    },
+    /// Remove duplicate packages
+    Dedupe,
+    /// Show why a package is installed
+    Why {
+        /// Package name to check
+        package: String,
+    },
     /// Add one or more packages
     Add {
         /// Packages to add (e.g. react, react@18.0.0)
@@ -106,6 +123,11 @@ async fn main() {
         Some(Commands::X { package, args }) => manager.exec_package(&package, args).await,
         Some(Commands::Cache { command }) => manager.handle_cache_command(command).await,
         Some(Commands::Install) => manager.install().await,
+        Some(Commands::List) => manager.list_packages().await,
+        Some(Commands::Outdated) => manager.outdated_packages().await,
+        Some(Commands::Update { packages }) => manager.update_packages(packages).await,
+        Some(Commands::Dedupe) => manager.dedupe_packages().await,
+        Some(Commands::Why { package }) => manager.why_package(&package).await,
         None => {
             Cli::command().print_help().unwrap();
             return;

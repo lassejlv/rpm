@@ -23,6 +23,10 @@ pub struct PackageJson {
     pub dependencies: BTreeMap<String, String>,
     #[serde(default)]
     pub dev_dependencies: BTreeMap<String, String>,
+    #[serde(default, rename = "peerDependencies")]
+    pub peer_dependencies: BTreeMap<String, String>,
+    #[serde(default, rename = "optionalDependencies")]
+    pub optional_dependencies: BTreeMap<String, String>,
     #[serde(default)]
     pub scripts: HashMap<String, String>,
     #[serde(default)]
@@ -46,6 +50,10 @@ pub struct RegistryVersion {
     pub dist: RegistryDist,
     #[serde(default)]
     pub dependencies: BTreeMap<String, String>,
+    #[serde(default, rename = "peerDependencies")]
+    pub peer_dependencies: BTreeMap<String, String>,
+    #[serde(default, rename = "optionalDependencies")]
+    pub optional_dependencies: BTreeMap<String, String>,
     #[serde(default)]
     pub scripts: HashMap<String, String>,
     #[serde(default)]
@@ -75,6 +83,18 @@ pub struct LockPackage {
     pub integrity: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dependencies: BTreeMap<String, String>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        rename = "peerDependencies"
+    )]
+    pub peer_dependencies: BTreeMap<String, String>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        rename = "optionalDependencies"
+    )]
+    pub optional_dependencies: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub postinstall: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

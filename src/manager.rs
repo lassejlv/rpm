@@ -7,6 +7,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -24,6 +25,11 @@ pub struct Manager {
     postinstalls: Arc<DashMap<String, (PathBuf, String)>>,
     auto_confirm: bool,
     ignore_scripts: bool,
+    // Progress tracking
+    packages_installed: Arc<AtomicUsize>,
+    packages_resolved: Arc<AtomicUsize>,
+    packages_cached: Arc<AtomicUsize>,
+    progress_bar: Arc<tokio::sync::Mutex<Option<ProgressBar>>>,
 }
 
 impl Manager {
@@ -43,6 +49,10 @@ impl Manager {
             postinstalls: Arc::new(DashMap::new()),
             auto_confirm,
             ignore_scripts,
+            packages_installed: Arc::new(AtomicUsize::new(0)),
+            packages_resolved: Arc::new(AtomicUsize::new(0)),
+            packages_cached: Arc::new(AtomicUsize::new(0)),
+            progress_bar: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -56,6 +66,48 @@ impl Manager {
         );
         spinner.enable_steady_tick(std::time::Duration::from_millis(80));
         spinner
+    }
+
+    fn create_install_progress(&self) -> ProgressBar {
+        let pb = self.multi_progress.add(ProgressBar::new_spinner());
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.cyan} {msg}")
+                .unwrap()
+                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+        );
+        pb.enable_steady_tick(std::time::Duration::from_millis(80));
+        pb
+    }
+
+    fn update_progress(&self) {
+        let installed = self.packages_installed.load(Ordering::Relaxed);
+        let resolved = self.packages_resolved.load(Ordering::Relaxed);
+        let cached = self.packages_cached.load(Ordering::Relaxed);
+
+        let msg = if cached > 0 {
+            format!(
+                "\x1b[1mResolving\x1b[0m \x1b[36m{}\x1b[0m packages  \x1b[90m│\x1b[0m  \x1b[1mInstalling\x1b[0m \x1b[32m{}\x1b[0m  \x1b[90m│\x1b[0m  \x1b[90mCached\x1b[0m \x1b[33m{}\x1b[0m",
+                resolved, installed, cached
+            )
+        } else {
+            format!(
+                "\x1b[1mResolving\x1b[0m \x1b[36m{}\x1b[0m packages  \x1b[90m│\x1b[0m  \x1b[1mInstalling\x1b[0m \x1b[32m{}\x1b[0m",
+                resolved, installed
+            )
+        };
+
+        if let Ok(guard) = self.progress_bar.try_lock() {
+            if let Some(pb) = guard.as_ref() {
+                pb.set_message(msg);
+            }
+        }
+    }
+
+    fn reset_progress(&self) {
+        self.packages_installed.store(0, Ordering::Relaxed);
+        self.packages_resolved.store(0, Ordering::Relaxed);
+        self.packages_cached.store(0, Ordering::Relaxed);
     }
 
     async fn load_lockfile(&self) -> Result<()> {
@@ -78,6 +130,605 @@ impl Manager {
         let content = serde_json::to_string_pretty(&*lock)?;
         fs::write("rpm-lock.json", content).await?;
         Ok(())
+    }
+
+    pub async fn list_packages(&self) -> Result<()> {
+        let package_json_content = fs::read_to_string("package.json")
+            .await
+            .context("Could not find package.json in current directory")?;
+        let package_json: PackageJson = serde_json::from_str(&package_json_content)?;
+
+        println!(
+            "\x1b[1m{}@{}\x1b[0m",
+            package_json.name, package_json.version
+        );
+
+        let has_deps = !package_json.dependencies.is_empty();
+        let has_dev_deps = !package_json.dev_dependencies.is_empty();
+
+        if !has_deps && !has_dev_deps {
+            println!("\x1b[90m(no dependencies)\x1b[0m");
+            return Ok(());
+        }
+
+        if has_deps {
+            println!("\n\x1b[1;36mDependencies:\x1b[0m");
+            for (name, version) in &package_json.dependencies {
+                let installed = self.get_installed_version(name).await;
+                match installed {
+                    Some(v) => println!(
+                        "  \x1b[32m├─\x1b[0m {}@\x1b[90m{}\x1b[0m (installed: \x1b[36m{}\x1b[0m)",
+                        name, version, v
+                    ),
+                    None => println!(
+                        "  \x1b[33m├─\x1b[0m {}@\x1b[90m{}\x1b[0m \x1b[33m(not installed)\x1b[0m",
+                        name, version
+                    ),
+                }
+            }
+        }
+
+        if has_dev_deps {
+            println!("\n\x1b[1;35mDev Dependencies:\x1b[0m");
+            for (name, version) in &package_json.dev_dependencies {
+                let installed = self.get_installed_version(name).await;
+                match installed {
+                    Some(v) => println!(
+                        "  \x1b[32m├─\x1b[0m {}@\x1b[90m{}\x1b[0m (installed: \x1b[36m{}\x1b[0m)",
+                        name, version, v
+                    ),
+                    None => println!(
+                        "  \x1b[33m├─\x1b[0m {}@\x1b[90m{}\x1b[0m \x1b[33m(not installed)\x1b[0m",
+                        name, version
+                    ),
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn outdated_packages(&self) -> Result<()> {
+        let package_json_content = fs::read_to_string("package.json")
+            .await
+            .context("Could not find package.json in current directory")?;
+        let package_json: PackageJson = serde_json::from_str(&package_json_content)?;
+
+        let has_deps = !package_json.dependencies.is_empty();
+        let has_dev_deps = !package_json.dev_dependencies.is_empty();
+
+        if !has_deps && !has_dev_deps {
+            println!("\x1b[90m(no dependencies)\x1b[0m");
+            return Ok(());
+        }
+
+        let spinner = self.create_spinner();
+        spinner.set_message("\x1b[1mChecking\x1b[0m for updates...");
+
+        let mut outdated: Vec<(String, String, String, String, bool)> = Vec::new(); // (name, current, wanted, latest, is_dev)
+
+        // Check regular dependencies
+        for (name, version_range) in &package_json.dependencies {
+            if let Some((current, wanted, latest)) = self.check_outdated(name, version_range).await
+            {
+                outdated.push((name.clone(), current, wanted, latest, false));
+            }
+        }
+
+        // Check dev dependencies
+        for (name, version_range) in &package_json.dev_dependencies {
+            if let Some((current, wanted, latest)) = self.check_outdated(name, version_range).await
+            {
+                outdated.push((name.clone(), current, wanted, latest, true));
+            }
+        }
+
+        spinner.finish_and_clear();
+
+        if outdated.is_empty() {
+            println!("\x1b[32m✓\x1b[0m All packages are up to date!");
+            return Ok(());
+        }
+
+        // Print header
+        println!(
+            "\x1b[1m{:<30} {:>12} {:>12} {:>12}  {}\x1b[0m",
+            "Package", "Current", "Wanted", "Latest", "Type"
+        );
+        println!("{}", "─".repeat(78));
+
+        for (name, current, wanted, latest, is_dev) in &outdated {
+            let type_label = if *is_dev {
+                "\x1b[35mdev\x1b[0m"
+            } else {
+                "\x1b[36mdep\x1b[0m"
+            };
+
+            let wanted_color = if wanted != current {
+                "\x1b[33m"
+            } else {
+                "\x1b[90m"
+            };
+            let latest_color = if latest != current {
+                "\x1b[31m"
+            } else {
+                "\x1b[90m"
+            };
+
+            println!(
+                "{:<30} \x1b[90m{:>12}\x1b[0m {:>12} {:>12}  {}",
+                name,
+                current,
+                format!("{}{}\x1b[0m", wanted_color, wanted),
+                format!("{}{}\x1b[0m", latest_color, latest),
+                type_label
+            );
+        }
+
+        println!();
+        println!(
+            "\x1b[90m{} package(s) can be updated\x1b[0m",
+            outdated.len()
+        );
+
+        Ok(())
+    }
+
+    async fn check_outdated(
+        &self,
+        name: &str,
+        version_range: &str,
+    ) -> Option<(String, String, String)> {
+        // Get installed version
+        let current = self.get_installed_version(name).await?;
+
+        // Fetch latest from registry
+        let package = self.registry.get_package(name).await.ok()?;
+        let latest = package.dist_tags.get("latest")?.clone();
+
+        // Resolve wanted version based on version range
+        let wanted = self
+            .registry
+            .resolve_version(&package, version_range)
+            .ok()
+            .map(|v| v.version.clone())
+            .unwrap_or_else(|| current.clone());
+
+        // Only return if there's an update available
+        if current != wanted || current != latest {
+            Some((current, wanted, latest))
+        } else {
+            None
+        }
+    }
+
+    pub async fn update_packages(&self, packages: Vec<String>) -> Result<()> {
+        self.load_lockfile().await?;
+        let package_json_content = fs::read_to_string("package.json")
+            .await
+            .context("Could not find package.json in current directory")?;
+        let mut package_json: PackageJson = serde_json::from_str(&package_json_content)?;
+
+        let spinner = self.create_spinner();
+        spinner.set_message("\x1b[1mChecking\x1b[0m for updates...");
+
+        let mut to_update: Vec<(String, String, String, bool)> = Vec::new(); // (name, old_version, new_version, is_dev)
+
+        // Determine which packages to check
+        let check_all = packages.is_empty();
+
+        // Check regular dependencies
+        for (name, _version_range) in &package_json.dependencies {
+            if !check_all && !packages.contains(name) {
+                continue;
+            }
+
+            if let Some((current, latest)) = self.get_latest_version(name).await {
+                if current != latest {
+                    to_update.push((name.clone(), current, latest, false));
+                }
+            }
+        }
+
+        // Check dev dependencies
+        for (name, _version_range) in &package_json.dev_dependencies {
+            if !check_all && !packages.contains(name) {
+                continue;
+            }
+
+            if let Some((current, latest)) = self.get_latest_version(name).await {
+                if current != latest {
+                    to_update.push((name.clone(), current, latest, true));
+                }
+            }
+        }
+
+        spinner.finish_and_clear();
+
+        if to_update.is_empty() {
+            println!("\x1b[32m✓\x1b[0m All packages are up to date!");
+            return Ok(());
+        }
+
+        // Update package.json with new versions
+        for (name, old_version, new_version, is_dev) in &to_update {
+            println!(
+                "\x1b[36m↑\x1b[0m \x1b[1m{}\x1b[0m \x1b[90m{}\x1b[0m → \x1b[32m{}\x1b[0m",
+                name, old_version, new_version
+            );
+
+            if *is_dev {
+                package_json
+                    .dev_dependencies
+                    .insert(name.clone(), format!("^{}", new_version));
+            } else {
+                package_json
+                    .dependencies
+                    .insert(name.clone(), format!("^{}", new_version));
+            }
+
+            // Remove from lockfile to force re-fetch
+            {
+                let mut lock = self.lockfile.lock().await;
+                let key = format!("node_modules/{}", name);
+                lock.packages.remove(&key);
+            }
+
+            // Remove from node_modules
+            let pkg_path = PathBuf::from("node_modules").join(name);
+            if pkg_path.exists() {
+                let _ = fs::remove_dir_all(&pkg_path).await;
+            }
+        }
+
+        // Save updated package.json
+        let new_content = serde_json::to_string_pretty(&package_json)?;
+        fs::write("package.json", new_content).await?;
+
+        println!();
+
+        // Reset and setup progress tracking
+        self.reset_progress();
+        let pb = self.create_install_progress();
+        pb.set_message("\x1b[1mInstalling\x1b[0m updates...");
+        *self.progress_bar.lock().await = Some(pb.clone());
+
+        self.install_deps(&package_json).await?;
+
+        let installed = self.packages_installed.load(Ordering::Relaxed);
+        let cached = self.packages_cached.load(Ordering::Relaxed);
+
+        pb.finish_and_clear();
+        *self.progress_bar.lock().await = None;
+
+        // Print summary
+        if installed > 0 || cached > 0 {
+            let mut parts = Vec::new();
+            if installed > 0 {
+                parts.push(format!("\x1b[32m+{}\x1b[0m installed", installed));
+            }
+            if cached > 0 {
+                parts.push(format!("\x1b[33m{}\x1b[0m cached", cached));
+            }
+            println!("{}", parts.join("  \x1b[90m│\x1b[0m  "));
+        }
+
+        self.run_postinstalls().await?;
+        self.save_lockfile(&package_json.name, &package_json.version)
+            .await?;
+
+        println!("\n\x1b[32m✓\x1b[0m Updated {} package(s)", to_update.len());
+
+        Ok(())
+    }
+
+    pub async fn dedupe_packages(&self) -> Result<()> {
+        let package_json_content = fs::read_to_string("package.json")
+            .await
+            .context("Could not find package.json in current directory")?;
+        let package_json: PackageJson = serde_json::from_str(&package_json_content)?;
+
+        let node_modules = std::env::current_dir()?.join("node_modules");
+        if !node_modules.exists() {
+            println!("\x1b[33m!\x1b[0m No node_modules found. Run 'rpm install' first.");
+            return Ok(());
+        }
+
+        let spinner = self.create_spinner();
+        spinner.set_message("\x1b[1mAnalyzing\x1b[0m dependencies...");
+
+        let mut duplicates_found = 0;
+        let mut bytes_saved: u64 = 0;
+
+        // Scan for nested node_modules
+        let mut to_check: Vec<PathBuf> = vec![node_modules.clone()];
+
+        while let Some(dir) = to_check.pop() {
+            let mut entries = match tokio::fs::read_dir(&dir).await {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+
+                if !path.is_dir() || name.starts_with('.') {
+                    continue;
+                }
+
+                // Handle scoped packages
+                if name.starts_with('@') {
+                    to_check.push(path);
+                    continue;
+                }
+
+                // Check for nested node_modules
+                let nested_nm = path.join("node_modules");
+                if nested_nm.exists() {
+                    if let Ok(mut nested_entries) = tokio::fs::read_dir(&nested_nm).await {
+                        while let Ok(Some(nested_entry)) = nested_entries.next_entry().await {
+                            let nested_path = nested_entry.path();
+                            let nested_name =
+                                nested_entry.file_name().to_string_lossy().to_string();
+
+                            if nested_name.starts_with('.') || !nested_path.is_dir() {
+                                continue;
+                            }
+
+                            // Handle scoped packages in nested node_modules
+                            if nested_name.starts_with('@') {
+                                if let Ok(mut scoped_entries) =
+                                    tokio::fs::read_dir(&nested_path).await
+                                {
+                                    while let Ok(Some(scoped_entry)) =
+                                        scoped_entries.next_entry().await
+                                    {
+                                        let scoped_path = scoped_entry.path();
+                                        let scoped_pkg_name = format!(
+                                            "{}/{}",
+                                            nested_name,
+                                            scoped_entry.file_name().to_string_lossy()
+                                        );
+
+                                        if let Some(saved) = self
+                                            .try_dedupe_package(
+                                                &node_modules,
+                                                &scoped_path,
+                                                &scoped_pkg_name,
+                                            )
+                                            .await
+                                        {
+                                            duplicates_found += 1;
+                                            bytes_saved += saved;
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+
+                            // Check if this package exists at the top level with compatible version
+                            if let Some(saved) = self
+                                .try_dedupe_package(&node_modules, &nested_path, &nested_name)
+                                .await
+                            {
+                                duplicates_found += 1;
+                                bytes_saved += saved;
+                            }
+                        }
+                    }
+                    to_check.push(nested_nm);
+                }
+            }
+        }
+
+        spinner.finish_and_clear();
+
+        if duplicates_found == 0 {
+            println!("\x1b[32m✓\x1b[0m No duplicates found. Dependencies are already optimized.");
+        } else {
+            println!(
+                "\x1b[32m✓\x1b[0m Removed \x1b[1m{}\x1b[0m duplicate(s), saved \x1b[36m{:.2} MB\x1b[0m",
+                duplicates_found,
+                bytes_saved as f64 / 1024.0 / 1024.0
+            );
+        }
+
+        // Rebuild lockfile
+        self.save_lockfile(&package_json.name, &package_json.version)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn try_dedupe_package(
+        &self,
+        root_nm: &PathBuf,
+        nested_path: &PathBuf,
+        pkg_name: &str,
+    ) -> Option<u64> {
+        // Get nested package version
+        let nested_pkg_json = nested_path.join("package.json");
+        let nested_content = fs::read_to_string(&nested_pkg_json).await.ok()?;
+        let nested_pkg: PackageJson = serde_json::from_str(&nested_content).ok()?;
+        let nested_version = &nested_pkg.version;
+
+        // Check if same version exists at root
+        let root_path = root_nm.join(pkg_name);
+        if !root_path.exists() {
+            return None;
+        }
+
+        let root_pkg_json = root_path.join("package.json");
+        let root_content = fs::read_to_string(&root_pkg_json).await.ok()?;
+        let root_pkg: PackageJson = serde_json::from_str(&root_content).ok()?;
+        let root_version = &root_pkg.version;
+
+        // If versions match, we can dedupe
+        if nested_version == root_version {
+            // Calculate size before removing
+            let size = fs_extra::dir::get_size(nested_path).unwrap_or(0);
+
+            // Remove the nested duplicate
+            if fs::remove_dir_all(nested_path).await.is_ok() {
+                let _ = self.multi_progress.println(format!(
+                    "\x1b[33m-\x1b[0m \x1b[1m{}\x1b[0m@{} (duplicate)",
+                    pkg_name, nested_version
+                ));
+                return Some(size);
+            }
+        }
+
+        None
+    }
+
+    async fn get_latest_version(&self, name: &str) -> Option<(String, String)> {
+        let current = self.get_installed_version(name).await?;
+        let package = self.registry.get_package(name).await.ok()?;
+        let latest = package.dist_tags.get("latest")?.clone();
+        Some((current, latest))
+    }
+
+    async fn get_installed_version(&self, name: &str) -> Option<String> {
+        let pkg_json_path = std::env::current_dir()
+            .ok()?
+            .join("node_modules")
+            .join(name)
+            .join("package.json");
+
+        if let Ok(content) = fs::read_to_string(&pkg_json_path).await {
+            if let Ok(pkg) = serde_json::from_str::<PackageJson>(&content) {
+                return Some(pkg.version);
+            }
+        }
+        None
+    }
+
+    pub async fn why_package(&self, name: &str) -> Result<()> {
+        let package_json_content = fs::read_to_string("package.json")
+            .await
+            .context("Could not find package.json in current directory")?;
+        let package_json: PackageJson = serde_json::from_str(&package_json_content)?;
+
+        let mut found = false;
+        let mut dependents: Vec<(String, String, bool)> = Vec::new(); // (name, version, is_dev)
+
+        // Check if it's a direct dependency
+        if let Some(version) = package_json.dependencies.get(name) {
+            println!("\x1b[1m{}\x1b[0m@\x1b[90m{}\x1b[0m", name, version);
+            println!(
+                "  \x1b[32m├─\x1b[0m Direct dependency in \x1b[1m{}\x1b[0m",
+                package_json.name
+            );
+            found = true;
+        }
+
+        // Check if it's a direct dev dependency
+        if let Some(version) = package_json.dev_dependencies.get(name) {
+            if !found {
+                println!("\x1b[1m{}\x1b[0m@\x1b[90m{}\x1b[0m", name, version);
+            }
+            println!(
+                "  \x1b[35m├─\x1b[0m Dev dependency in \x1b[1m{}\x1b[0m",
+                package_json.name
+            );
+            found = true;
+        }
+
+        // Check transitive dependencies by scanning node_modules
+        let node_modules = std::env::current_dir()?.join("node_modules");
+        if node_modules.exists() {
+            if let Ok(mut entries) = tokio::fs::read_dir(&node_modules).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let path = entry.path();
+                    let pkg_name = entry.file_name().to_string_lossy().to_string();
+
+                    // Skip hidden folders and the target package itself
+                    if pkg_name.starts_with('.') || pkg_name == name {
+                        continue;
+                    }
+
+                    // Handle scoped packages
+                    if pkg_name.starts_with('@') {
+                        if let Ok(mut scoped_entries) = tokio::fs::read_dir(&path).await {
+                            while let Ok(Some(scoped_entry)) = scoped_entries.next_entry().await {
+                                let scoped_path = scoped_entry.path();
+                                let scoped_name = format!(
+                                    "{}/{}",
+                                    pkg_name,
+                                    scoped_entry.file_name().to_string_lossy()
+                                );
+
+                                if let Some(dep_info) = self
+                                    .check_package_depends_on(&scoped_path, &scoped_name, name)
+                                    .await
+                                {
+                                    let is_dev =
+                                        package_json.dev_dependencies.contains_key(&scoped_name);
+                                    dependents.push((scoped_name, dep_info, is_dev));
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    if let Some(dep_info) =
+                        self.check_package_depends_on(&path, &pkg_name, name).await
+                    {
+                        let is_dev = package_json.dev_dependencies.contains_key(&pkg_name);
+                        dependents.push((pkg_name, dep_info, is_dev));
+                    }
+                }
+            }
+        }
+
+        if !dependents.is_empty() {
+            if !found {
+                let installed_version = self
+                    .get_installed_version(name)
+                    .await
+                    .unwrap_or_else(|| "?".to_string());
+                println!(
+                    "\x1b[1m{}\x1b[0m@\x1b[90m{}\x1b[0m",
+                    name, installed_version
+                );
+            }
+            println!("\n\x1b[1;36mRequired by:\x1b[0m");
+            for (dep_name, version_req, is_dev) in &dependents {
+                let marker = if *is_dev { "\x1b[35m" } else { "\x1b[32m" };
+                println!(
+                    "  {}├─\x1b[0m \x1b[1m{}\x1b[0m requires \x1b[90m{}\x1b[0m",
+                    marker, dep_name, version_req
+                );
+            }
+            found = true;
+        }
+
+        if !found {
+            println!(
+                "\x1b[33mPackage '{}' is not installed or not a dependency\x1b[0m",
+                name
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn check_package_depends_on(
+        &self,
+        pkg_path: &std::path::Path,
+        _pkg_name: &str,
+        target: &str,
+    ) -> Option<String> {
+        let pkg_json_path = pkg_path.join("package.json");
+        if let Ok(content) = fs::read_to_string(&pkg_json_path).await {
+            if let Ok(pkg) = serde_json::from_str::<PackageJson>(&content) {
+                if let Some(version) = pkg.dependencies.get(target) {
+                    return Some(format!("{}@{}", target, version));
+                }
+            }
+        }
+        None
     }
 
     pub async fn handle_cache_command(&self, command: crate::CacheCommands) -> Result<()> {
@@ -118,6 +769,7 @@ impl Manager {
         let mut package_json: PackageJson = serde_json::from_str(&package_json_content)?;
 
         let spinner = self.create_spinner();
+        let mut added_packages: Vec<(String, String)> = Vec::new();
 
         for pkg_input in packages {
             let (name, range) = if let Some(idx) = pkg_input.rfind('@') {
@@ -150,17 +802,47 @@ impl Manager {
                     .dependencies
                     .insert(name.to_string(), format!("^{}", resolved.version));
             }
-            let _ = self.multi_progress.println(format!(
-                "\x1b[32m+\x1b[0m \x1b[1m{}\x1b[0m@\x1b[90m{}\x1b[0m",
-                name, resolved.version
-            ));
+            added_packages.push((name.to_string(), resolved.version.clone()));
         }
         spinner.finish_and_clear();
+
+        // Print added packages
+        for (name, version) in &added_packages {
+            println!(
+                "\x1b[32m+\x1b[0m \x1b[1m{}\x1b[0m@\x1b[90m{}\x1b[0m",
+                name, version
+            );
+        }
 
         let new_content = serde_json::to_string_pretty(&package_json)?;
         fs::write("package.json", new_content).await?;
 
+        // Reset and setup progress tracking for dependencies
+        self.reset_progress();
+        let pb = self.create_install_progress();
+        pb.set_message("\x1b[1mInstalling\x1b[0m dependencies...");
+        *self.progress_bar.lock().await = Some(pb.clone());
+
         self.install_deps(&package_json).await?;
+
+        let installed = self.packages_installed.load(Ordering::Relaxed);
+        let cached = self.packages_cached.load(Ordering::Relaxed);
+
+        pb.finish_and_clear();
+        *self.progress_bar.lock().await = None;
+
+        // Print summary
+        if installed > 0 || cached > 0 {
+            let mut parts = Vec::new();
+            if installed > 0 {
+                parts.push(format!("\x1b[32m+{}\x1b[0m installed", installed));
+            }
+            if cached > 0 {
+                parts.push(format!("\x1b[33m{}\x1b[0m cached", cached));
+            }
+            println!("{}", parts.join("  \x1b[90m│\x1b[0m  "));
+        }
+
         self.run_postinstalls().await?;
         self.save_lockfile(&package_json.name, &package_json.version)
             .await?;
@@ -446,12 +1128,33 @@ impl Manager {
         let package_json_content = fs::read_to_string("package.json").await?;
         let package_json: PackageJson = serde_json::from_str(&package_json_content)?;
 
-        // Main spinner for overall progress
-        let pb = self.create_spinner();
-        pb.set_message("\x1b[1mInstalling\x1b[0m dependencies...");
+        // Reset and setup progress tracking
+        self.reset_progress();
+        let pb = self.create_install_progress();
+        pb.set_message("\x1b[1mResolving\x1b[0m dependencies...");
+        *self.progress_bar.lock().await = Some(pb.clone());
 
         self.install_deps(&package_json).await?;
+
+        let installed = self.packages_installed.load(Ordering::Relaxed);
+        let cached = self.packages_cached.load(Ordering::Relaxed);
+
         pb.finish_and_clear();
+        *self.progress_bar.lock().await = None;
+
+        // Print summary
+        if installed > 0 || cached > 0 {
+            let mut parts = Vec::new();
+            if installed > 0 {
+                parts.push(format!("\x1b[32m+{}\x1b[0m installed", installed));
+            }
+            if cached > 0 {
+                parts.push(format!("\x1b[33m{}\x1b[0m cached", cached));
+            }
+            println!("{}", parts.join("  \x1b[90m│\x1b[0m  "));
+        } else {
+            println!("\x1b[90mNo packages to install\x1b[0m");
+        }
 
         self.run_postinstalls().await?;
         self.save_lockfile(&package_json.name, &package_json.version)
@@ -651,30 +1354,37 @@ impl Manager {
             lock.packages.get(&key).cloned()
         };
 
-        let (version, tarball, deps, postinstall, bin) = if let Some(entry) = lock_entry {
-            let matches = semver::Version::parse(&entry.version)
-                .ok()
-                .and_then(|v| {
-                    semver::VersionReq::parse(&version_range)
-                        .ok()
-                        .map(|r| r.matches(&v))
-                })
-                .unwrap_or(false);
+        let (version, tarball, deps, peer_deps, optional_deps, postinstall, bin) =
+            if let Some(entry) = lock_entry {
+                let matches = semver::Version::parse(&entry.version)
+                    .ok()
+                    .and_then(|v| {
+                        semver::VersionReq::parse(&version_range)
+                            .ok()
+                            .map(|r| r.matches(&v))
+                    })
+                    .unwrap_or(false);
 
-            if matches || version_range == entry.version {
-                (
-                    entry.version,
-                    entry.resolved,
-                    entry.dependencies,
-                    entry.postinstall,
-                    entry.bin,
-                )
+                if matches || version_range == entry.version {
+                    (
+                        entry.version,
+                        entry.resolved,
+                        entry.dependencies,
+                        entry.peer_dependencies,
+                        entry.optional_dependencies,
+                        entry.postinstall,
+                        entry.bin,
+                    )
+                } else {
+                    self.fetch_and_resolve(&name, &version_range).await?
+                }
             } else {
                 self.fetch_and_resolve(&name, &version_range).await?
-            }
-        } else {
-            self.fetch_and_resolve(&name, &version_range).await?
-        };
+            };
+
+        // Track resolved packages
+        self.packages_resolved.fetch_add(1, Ordering::Relaxed);
+        self.update_progress();
 
         if self.installed.contains_key(&name) {
             return Ok(());
@@ -685,10 +1395,6 @@ impl Manager {
         let already_exists = install_path.join("package.json").exists();
 
         if !already_exists {
-            // Create a temporary spinner for this package download
-            let pb = self.create_spinner();
-            pb.set_message(format!("\x1b[1m{}\x1b[0m@\x1b[90m{}\x1b[0m", name, version));
-
             let install_res = async {
                 let install_dir = std::env::current_dir().unwrap();
                 self.installer
@@ -699,8 +1405,9 @@ impl Manager {
 
             match install_res {
                 Ok(_) => {
-                    // Success! Clear the spinner
-                    pb.finish_and_clear();
+                    // Track installed packages
+                    self.packages_installed.fetch_add(1, Ordering::Relaxed);
+                    self.update_progress();
 
                     // Collect postinstall if exists
                     if let Some(script) = &postinstall {
@@ -709,13 +1416,17 @@ impl Manager {
                     }
                 }
                 Err(e) => {
-                    pb.finish_with_message(format!(
-                        "\x1b[31mx\x1b[0m \x1b[1m{}\x1b[0m failed: {}",
-                        name, e
+                    let _ = self.multi_progress.println(format!(
+                        "\x1b[31m✗\x1b[0m \x1b[1m{}\x1b[0m@{} failed: {}",
+                        name, version, e
                     ));
                     return Err(e);
                 }
             }
+        } else {
+            // Package was cached/already existed
+            self.packages_cached.fetch_add(1, Ordering::Relaxed);
+            self.update_progress();
         }
 
         // Always try to link binaries if they exist
@@ -733,16 +1444,38 @@ impl Manager {
                     resolved: tarball.clone(),
                     integrity: None,
                     dependencies: deps.clone(),
+                    peer_dependencies: peer_deps.clone(),
+                    optional_dependencies: optional_deps.clone(),
                     postinstall: postinstall.clone(),
                     bin: bin.clone(),
                 },
             );
         }
 
-        let mut tasks = FuturesUnordered::new();
+        // Collect all dependencies to install
+        let mut all_deps: Vec<(String, String)> = Vec::new();
+
+        // Regular dependencies
         for (dep_name, dep_ver) in deps {
-            let dep_name = dep_name.clone();
-            let dep_ver = dep_ver.clone();
+            all_deps.push((dep_name.clone(), dep_ver.clone()));
+        }
+
+        // Peer dependencies (auto-installed like npm 7+)
+        for (dep_name, dep_ver) in peer_deps {
+            if !self.installed.contains_key(&dep_name) {
+                all_deps.push((dep_name.clone(), dep_ver.clone()));
+            }
+        }
+
+        // Optional dependencies
+        let optional_deps_list: Vec<(String, String)> = optional_deps
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        // Install regular and peer dependencies
+        let mut tasks = FuturesUnordered::new();
+        for (dep_name, dep_ver) in all_deps {
             let target_dir = target_dir.clone();
             let manager = self.clone();
             tasks.push(async move {
@@ -759,6 +1492,14 @@ impl Manager {
                     .println(format!("\x1b[33mwarn:\x1b[0m {} - {}", name, e));
             }
         }
+
+        // Install optional dependencies (failures are silently ignored)
+        for (dep_name, dep_ver) in optional_deps_list {
+            let target_dir = target_dir.clone();
+            let _ = self
+                .resolve_and_install(dep_name, dep_ver, target_dir)
+                .await;
+        }
         Ok(())
     }
 
@@ -769,6 +1510,8 @@ impl Manager {
     ) -> Result<(
         String,
         String,
+        BTreeMap<String, String>,
+        BTreeMap<String, String>,
         BTreeMap<String, String>,
         Option<String>,
         Option<serde_json::Value>,
@@ -787,6 +1530,8 @@ impl Manager {
             resolved.version.clone(),
             resolved.dist.tarball.clone(),
             resolved.dependencies.clone(),
+            resolved.peer_dependencies.clone(),
+            resolved.optional_dependencies.clone(),
             postinstall,
             resolved.bin.clone(),
         ))
