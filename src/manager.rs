@@ -46,6 +46,18 @@ impl Manager {
         }
     }
 
+    fn create_spinner(&self) -> ProgressBar {
+        let spinner = self.multi_progress.add(ProgressBar::new_spinner());
+        spinner.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.cyan} {msg}")
+                .unwrap()
+                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+        );
+        spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+        spinner
+    }
+
     async fn load_lockfile(&self) -> Result<()> {
         if let Ok(content) = fs::read_to_string("rpm-lock.json").await {
             let lock: LockFile = serde_json::from_str(&content).unwrap_or_else(|_| LockFile {
@@ -105,14 +117,7 @@ impl Manager {
         let package_json_content = fs::read_to_string("package.json").await?;
         let mut package_json: PackageJson = serde_json::from_str(&package_json_content)?;
 
-        let spinner = self.multi_progress.add(ProgressBar::new_spinner());
-        spinner.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.cyan} {msg}")
-                .unwrap()
-                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
-        );
-        spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+        let spinner = self.create_spinner();
 
         for pkg_input in packages {
             let (name, range) = if let Some(idx) = pkg_input.rfind('@') {
@@ -258,14 +263,7 @@ impl Manager {
         }
 
         // Not found locally, need to fetch and run
-        let spinner = self.multi_progress.add(ProgressBar::new_spinner());
-        spinner.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.cyan} {msg}")
-                .unwrap()
-                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
-        );
-        spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+        let spinner = self.create_spinner();
         spinner.set_message(format!("\x1b[1mFetching\x1b[0m {}...", name));
 
         // Fetch package metadata
@@ -449,14 +447,8 @@ impl Manager {
         let package_json: PackageJson = serde_json::from_str(&package_json_content)?;
 
         // Main spinner for overall progress
-        let pb = self.multi_progress.add(ProgressBar::new(0));
-        pb.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.cyan} \x1b[1mInstalling\x1b[0m dependencies...")
-                .unwrap()
-                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
-        );
-        pb.enable_steady_tick(std::time::Duration::from_millis(80));
+        let pb = self.create_spinner();
+        pb.set_message("\x1b[1mInstalling\x1b[0m dependencies...");
 
         self.install_deps(&package_json).await?;
         pb.finish_and_clear();
@@ -694,14 +686,7 @@ impl Manager {
 
         if !already_exists {
             // Create a temporary spinner for this package download
-            let pb = self.multi_progress.add(ProgressBar::new(0));
-            pb.set_style(
-                ProgressStyle::default_spinner()
-                    .template("{spinner:.cyan} {msg}")
-                    .unwrap()
-                    .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
-            );
-            pb.enable_steady_tick(std::time::Duration::from_millis(100));
+            let pb = self.create_spinner();
             pb.set_message(format!("\x1b[1m{}\x1b[0m@\x1b[90m{}\x1b[0m", name, version));
 
             let install_res = async {

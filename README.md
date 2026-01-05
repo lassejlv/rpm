@@ -4,7 +4,26 @@ A simple and fast Rust-based Package Manager for the npm registry. It allows you
 
 ## Installation
 
-You can install `rpm` by cloning the repository and building it from source:
+### Using the installer script (recommended)
+
+Clone the repository and run the installer script:
+
+```bash
+git clone https://github.com/lassejlv/rpm
+cd rpm
+
+# On Windows (PowerShell)
+.\scripts\install.ps1
+
+# On Linux/macOS
+./scripts/install.sh
+```
+
+> **Warning:** The installer will build rpm from source, which requires the Rust toolchain and may take several minutes. It will use significant CPU and memory resources during compilation.
+
+### Manual installation
+
+Alternatively, you can install manually using Cargo:
 
 ```bash
 git clone https://github.com/lassejlv/rpm
