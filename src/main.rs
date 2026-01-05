@@ -3,7 +3,7 @@ mod manager;
 mod registry;
 mod types;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use manager::Manager;
 use std::time::Instant;
 
@@ -105,7 +105,11 @@ async fn main() {
         Some(Commands::Run { script, args }) => manager.run_script(&script, args).await,
         Some(Commands::X { package, args }) => manager.exec_package(&package, args).await,
         Some(Commands::Cache { command }) => manager.handle_cache_command(command).await,
-        Some(Commands::Install) | None => manager.install().await,
+        Some(Commands::Install) => manager.install().await,
+        None => {
+            Cli::command().print_help().unwrap();
+            return;
+        }
     };
 
     if let Err(e) = result {
