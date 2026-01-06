@@ -1,6 +1,6 @@
 use crate::installer::Installer;
 use crate::registry::Registry;
-use crate::types::{LockFile, LockPackage, PackageJson};
+use crate::types::{LockFile, LockPackage, PackageJson, RegistryVersion};
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -13,6 +13,77 @@ use tokio::fs;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
+
+/// Get the current OS name in npm's format
+fn get_current_os() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "win32"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "freebsd") {
+        "freebsd"
+    } else if cfg!(target_os = "openbsd") {
+        "openbsd"
+    } else if cfg!(target_os = "android") {
+        "android"
+    } else {
+        "unknown"
+    }
+}
+
+/// Get the current CPU architecture in npm's format
+fn get_current_cpu() -> &'static str {
+    if cfg!(target_arch = "x86_64") {
+        "x64"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else if cfg!(target_arch = "x86") {
+        "ia32"
+    } else if cfg!(target_arch = "arm") {
+        "arm"
+    } else {
+        "unknown"
+    }
+}
+
+/// Check if a package is compatible with the current platform
+fn is_platform_compatible(os: &[String], cpu: &[String]) -> bool {
+    let os_ok = if os.is_empty() {
+        true
+    } else {
+        let current_os = get_current_os();
+        // Check for negation pattern (e.g., "!win32" means "not windows")
+        let has_negation = os.iter().any(|s| s.starts_with('!'));
+        if has_negation {
+            // If there are negations, the package is compatible if current OS is NOT in the negated list
+            !os.iter().any(|s| s.strip_prefix('!') == Some(current_os))
+        } else {
+            // Otherwise, current OS must be in the list
+            os.iter().any(|s| s == current_os)
+        }
+    };
+
+    let cpu_ok = if cpu.is_empty() {
+        true
+    } else {
+        let current_cpu = get_current_cpu();
+        let has_negation = cpu.iter().any(|s| s.starts_with('!'));
+        if has_negation {
+            !cpu.iter().any(|s| s.strip_prefix('!') == Some(current_cpu))
+        } else {
+            cpu.iter().any(|s| s == current_cpu)
+        }
+    };
+
+    os_ok && cpu_ok
+}
+
+/// Check if a RegistryVersion is compatible with current platform
+fn is_version_platform_compatible(version: &RegistryVersion) -> bool {
+    is_platform_compatible(&version.os, &version.cpu)
+}
 
 #[derive(Clone)]
 pub struct Manager {
@@ -982,13 +1053,19 @@ impl Manager {
             name
         ));
 
-        let mut to_install: Vec<(String, String)> = resolved
+        // Collect regular dependencies
+        let mut to_install: Vec<(String, String, bool)> = resolved
             .dependencies
             .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| (k.clone(), v.clone(), false)) // false = not optional
             .collect();
 
-        while let Some((dep_name, dep_version)) = to_install.pop() {
+        // Collect optional dependencies (platform-specific binaries)
+        for (k, v) in &resolved.optional_dependencies {
+            to_install.push((k.clone(), v.clone(), true)); // true = optional
+        }
+
+        while let Some((dep_name, dep_version, is_optional)) = to_install.pop() {
             let dep_install_path = temp_dir.join("node_modules").join(&dep_name);
             if dep_install_path.exists() {
                 continue;
@@ -996,6 +1073,11 @@ impl Manager {
 
             if let Ok(dep_pkg) = self.registry.get_package(&dep_name).await {
                 if let Ok(dep_resolved) = self.registry.resolve_version(&dep_pkg, &dep_version) {
+                    // For optional dependencies, check platform compatibility
+                    if is_optional && !is_version_platform_compatible(dep_resolved) {
+                        continue; // Skip platform-incompatible optional deps
+                    }
+
                     let _ = self
                         .installer
                         .install_package(
@@ -1006,11 +1088,19 @@ impl Manager {
                         )
                         .await;
 
-                    // Add transitive dependencies
+                    // Add transitive dependencies (not optional)
                     for (k, v) in &dep_resolved.dependencies {
                         let nested_path = temp_dir.join("node_modules").join(k);
                         if !nested_path.exists() {
-                            to_install.push((k.clone(), v.clone()));
+                            to_install.push((k.clone(), v.clone(), false));
+                        }
+                    }
+
+                    // Add transitive optional dependencies
+                    for (k, v) in &dep_resolved.optional_dependencies {
+                        let nested_path = temp_dir.join("node_modules").join(k);
+                        if !nested_path.exists() {
+                            to_install.push((k.clone(), v.clone(), true));
                         }
                     }
                 }
@@ -1493,14 +1583,37 @@ impl Manager {
             }
         }
 
-        // Install optional dependencies (failures are silently ignored)
+        // Install optional dependencies (with platform checking, failures are silently ignored)
         for (dep_name, dep_ver) in optional_deps_list {
-            let target_dir = target_dir.clone();
-            let _ = self
-                .resolve_and_install(dep_name, dep_ver, target_dir)
-                .await;
+            // Skip if already installed
+            if self.installed.contains_key(&dep_name) {
+                continue;
+            }
+
+            // Check platform compatibility before attempting to install
+            match self.check_optional_dep_compatible(&dep_name, &dep_ver).await {
+                Ok(true) => {
+                    let target_dir = target_dir.clone();
+                    let _ = self
+                        .resolve_and_install(dep_name, dep_ver, target_dir)
+                        .await;
+                }
+                Ok(false) => {
+                    // Package is not compatible with current platform, skip silently
+                }
+                Err(_) => {
+                    // Failed to check compatibility, skip silently (it's optional)
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Check if an optional dependency is compatible with the current platform
+    async fn check_optional_dep_compatible(&self, name: &str, range: &str) -> Result<bool> {
+        let package = self.registry.get_package(name).await?;
+        let resolved = self.registry.resolve_version(&package, range)?;
+        Ok(is_version_platform_compatible(resolved))
     }
 
     async fn fetch_and_resolve(

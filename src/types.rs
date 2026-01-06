@@ -58,6 +58,12 @@ pub struct RegistryVersion {
     pub scripts: HashMap<String, String>,
     #[serde(default)]
     pub bin: Option<Value>,
+    /// Platform restrictions - list of supported operating systems
+    #[serde(default)]
+    pub os: Vec<String>,
+    /// Platform restrictions - list of supported CPU architectures
+    #[serde(default)]
+    pub cpu: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
