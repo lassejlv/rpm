@@ -125,16 +125,16 @@ impl Installer {
             fs::create_dir_all(parent).await?;
         }
 
-        // Recursive copy from cache to install_path
-        copy_dir_recursive(&cache_path, &install_path).await?;
+        // Recursive hard-link from cache to install_path (much faster than copy)
+        link_dir_recursive(&cache_path, &install_path).await?;
 
         Ok(())
     }
 }
 
-// Recursive copy helper
+// Recursive hard-link helper (falls back to copy if hard link fails)
 #[async_recursion::async_recursion]
-async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+async fn link_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst).await?;
     let mut entries = fs::read_dir(src).await?;
 
@@ -144,9 +144,12 @@ async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         let dst_path = dst.join(entry.file_name());
 
         if file_type.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path).await?;
+            link_dir_recursive(&src_path, &dst_path).await?;
         } else {
-            fs::copy(&src_path, &dst_path).await?;
+            // Try hard link first (instant, no disk space), fall back to copy
+            if fs::hard_link(&src_path, &dst_path).await.is_err() {
+                fs::copy(&src_path, &dst_path).await?;
+            }
         }
     }
     Ok(())

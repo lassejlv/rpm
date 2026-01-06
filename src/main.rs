@@ -2,6 +2,7 @@ mod installer;
 mod manager;
 mod registry;
 mod types;
+mod workspace;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use manager::Manager;
@@ -79,7 +80,17 @@ enum Commands {
         /// Arguments to pass to the script
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+
+        /// Run script in all workspaces that have it
+        #[arg(short = 'w', long = "workspaces", alias = "ws")]
+        workspaces: bool,
+
+        /// Filter workspaces by name pattern
+        #[arg(long = "filter", short = 'f')]
+        filter: Option<String>,
     },
+    /// List workspace packages (monorepo)
+    Workspaces,
     /// Execute a package binary (like npx)
     #[command(visible_alias = "exec")]
     X {
@@ -119,7 +130,20 @@ async fn main() {
     let result = match cli.command {
         Some(Commands::Add { packages, dev }) => manager.add_packages(packages, dev).await,
         Some(Commands::Remove { packages }) => manager.remove_packages(packages).await,
-        Some(Commands::Run { script, args }) => manager.run_script(&script, args).await,
+        Some(Commands::Run {
+            script,
+            args,
+            workspaces,
+            filter,
+        }) => {
+            if workspaces {
+                manager
+                    .run_script_workspaces(&script, args, filter.as_deref())
+                    .await
+            } else {
+                manager.run_script(&script, args).await
+            }
+        }
         Some(Commands::X { package, args }) => manager.exec_package(&package, args).await,
         Some(Commands::Cache { command }) => manager.handle_cache_command(command).await,
         Some(Commands::Install) => manager.install().await,
@@ -128,6 +152,7 @@ async fn main() {
         Some(Commands::Update { packages }) => manager.update_packages(packages).await,
         Some(Commands::Dedupe) => manager.dedupe_packages().await,
         Some(Commands::Why { package }) => manager.why_package(&package).await,
+        Some(Commands::Workspaces) => manager.list_workspaces().await,
         None => {
             Cli::command().print_help().unwrap();
             return;

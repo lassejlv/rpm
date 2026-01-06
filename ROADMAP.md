@@ -35,10 +35,10 @@ RPM currently supports:
 - [ ] Local file dependencies (`file:../path`)
 
 ### Workspaces
-- [ ] Basic workspace support
-- [ ] `workspaces` field in `package.json`
-- [ ] Hoisting shared dependencies
-- [ ] Running scripts across workspaces
+- [x] Basic workspace support
+- [x] `workspaces` field in `package.json`
+- [x] Hoisting shared dependencies
+- [x] Running scripts across workspaces
 
 ## Medium-term Goals
 
@@ -71,7 +71,7 @@ RPM currently supports:
 - [ ] Parallel script execution
 - [ ] Lazy dependency resolution
 - [ ] Incremental installs
-- [ ] Hard linking for duplicate packages
+- [x] Hard linking for duplicate packages
 
 ### Advanced Features
 - [ ] `npm link` for local development

@@ -14,7 +14,7 @@ where
     Ok(opt.unwrap_or_else(default_version))
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PackageJson {
     pub name: String,
     #[serde(default = "default_version", deserialize_with = "deserialize_version")]
@@ -31,9 +31,20 @@ pub struct PackageJson {
     pub scripts: HashMap<String, String>,
     #[serde(default)]
     pub bin: Option<Value>,
+    /// Workspace glob patterns (e.g., ["packages/*", "apps/*"])
+    #[serde(default)]
+    pub workspaces: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+/// Represents a workspace member with its path and package.json
+#[derive(Debug, Clone)]
+pub struct WorkspaceMember {
+    pub name: String,
+    pub path: std::path::PathBuf,
+    pub package_json: PackageJson,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct RegistryPackage {
     #[serde(rename = "name")]
     pub _name: String,

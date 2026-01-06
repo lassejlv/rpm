@@ -1,6 +1,7 @@
 use crate::installer::Installer;
 use crate::registry::Registry;
 use crate::types::{LockFile, LockPackage, PackageJson, RegistryVersion};
+use crate::workspace::Workspace;
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -278,19 +279,32 @@ impl Manager {
 
         let mut outdated: Vec<(String, String, String, String, bool)> = Vec::new(); // (name, current, wanted, latest, is_dev)
 
-        // Check regular dependencies
-        for (name, version_range) in &package_json.dependencies {
-            if let Some((current, wanted, latest)) = self.check_outdated(name, version_range).await
-            {
-                outdated.push((name.clone(), current, wanted, latest, false));
-            }
+        // Collect all deps to check
+        let deps_to_check: Vec<(String, String, bool)> = package_json
+            .dependencies
+            .iter()
+            .map(|(n, v)| (n.clone(), v.clone(), false))
+            .chain(
+                package_json
+                    .dev_dependencies
+                    .iter()
+                    .map(|(n, v)| (n.clone(), v.clone(), true)),
+            )
+            .collect();
+
+        // Check all dependencies in parallel
+        let mut tasks = FuturesUnordered::new();
+        for (name, version_range, is_dev) in deps_to_check {
+            let manager = self.clone();
+            tasks.push(async move {
+                let result = manager.check_outdated(&name, &version_range).await;
+                (name, result, is_dev)
+            });
         }
 
-        // Check dev dependencies
-        for (name, version_range) in &package_json.dev_dependencies {
-            if let Some((current, wanted, latest)) = self.check_outdated(name, version_range).await
-            {
-                outdated.push((name.clone(), current, wanted, latest, true));
+        while let Some((name, result, is_dev)) = tasks.next().await {
+            if let Some((current, wanted, latest)) = result {
+                outdated.push((name, current, wanted, latest, is_dev));
             }
         }
 
@@ -388,28 +402,35 @@ impl Manager {
         // Determine which packages to check
         let check_all = packages.is_empty();
 
-        // Check regular dependencies
-        for (name, _version_range) in &package_json.dependencies {
-            if !check_all && !packages.contains(name) {
-                continue;
-            }
+        // Collect deps to check
+        let deps_to_check: Vec<(String, bool)> = package_json
+            .dependencies
+            .keys()
+            .filter(|n| check_all || packages.contains(*n))
+            .map(|n| (n.clone(), false))
+            .chain(
+                package_json
+                    .dev_dependencies
+                    .keys()
+                    .filter(|n| check_all || packages.contains(*n))
+                    .map(|n| (n.clone(), true)),
+            )
+            .collect();
 
-            if let Some((current, latest)) = self.get_latest_version(name).await {
-                if current != latest {
-                    to_update.push((name.clone(), current, latest, false));
-                }
-            }
+        // Check all dependencies in parallel
+        let mut tasks = FuturesUnordered::new();
+        for (name, is_dev) in deps_to_check {
+            let manager = self.clone();
+            tasks.push(async move {
+                let result = manager.get_latest_version(&name).await;
+                (name, result, is_dev)
+            });
         }
 
-        // Check dev dependencies
-        for (name, _version_range) in &package_json.dev_dependencies {
-            if !check_all && !packages.contains(name) {
-                continue;
-            }
-
-            if let Some((current, latest)) = self.get_latest_version(name).await {
+        while let Some((name, result, is_dev)) = tasks.next().await {
+            if let Some((current, latest)) = result {
                 if current != latest {
-                    to_update.push((name.clone(), current, latest, true));
+                    to_update.push((name, current, latest, is_dev));
                 }
             }
         }
@@ -1213,7 +1234,134 @@ impl Manager {
         Ok(())
     }
 
+    /// Run a script across all workspaces that have it defined
+    pub async fn run_script_workspaces(
+        &self,
+        script_name: &str,
+        args: Vec<String>,
+        filter: Option<&str>,
+    ) -> Result<()> {
+        let root = std::env::current_dir()?;
+        let workspace = Workspace::discover(&root)
+            .await?
+            .context("Not in a workspace. Use 'rpm run' without --workspaces flag.")?;
+
+        // Find all workspaces with this script
+        let scripts = workspace.get_scripts(script_name);
+
+        if scripts.is_empty() {
+            println!(
+                "\x1b[33mNo workspaces have script '{}'\x1b[0m",
+                script_name
+            );
+            return Ok(());
+        }
+
+        // Filter workspaces if specified
+        let scripts_to_run: Vec<_> = if let Some(filter_pattern) = filter {
+            scripts
+                .into_iter()
+                .filter(|(m, _)| {
+                    m.name.contains(filter_pattern) || m.name == filter_pattern
+                })
+                .collect()
+        } else {
+            scripts
+        };
+
+        if scripts_to_run.is_empty() {
+            println!(
+                "\x1b[33mNo matching workspaces have script '{}'\x1b[0m",
+                script_name
+            );
+            return Ok(());
+        }
+
+        println!(
+            "\x1b[1;36mRunning '{}' in {} workspace(s)\x1b[0m\n",
+            script_name,
+            scripts_to_run.len()
+        );
+
+        let root_bin_path = workspace.root.join("node_modules").join(".bin");
+        let path_env = std::env::var("PATH").unwrap_or_default();
+        let mut failed = false;
+
+        for (member, script) in scripts_to_run {
+            let relative_path = member
+                .path
+                .strip_prefix(&workspace.root)
+                .unwrap_or(&member.path);
+
+            println!(
+                "\x1b[1;36m{}\x1b[0m \x1b[90m({})\x1b[0m",
+                member.name,
+                relative_path.display()
+            );
+            println!("\x1b[90m$\x1b[0m {}\n", script);
+
+            // Build the full command with args
+            let full_command = if args.is_empty() {
+                script.clone()
+            } else {
+                format!("{} {}", script, args.join(" "))
+            };
+
+            // Add both workspace's node_modules/.bin and root node_modules/.bin to PATH
+            let local_bin_path = member.path.join("node_modules").join(".bin");
+            let new_path = format!(
+                "{}:{}:{}",
+                local_bin_path.display(),
+                root_bin_path.display(),
+                path_env
+            );
+
+            let status = Command::new("sh")
+                .arg("-c")
+                .arg(&full_command)
+                .current_dir(&member.path)
+                .env("PATH", &new_path)
+                .status()
+                .await?;
+
+            if !status.success() {
+                println!(
+                    "\x1b[31m✗\x1b[0m \x1b[1m{}\x1b[0m failed with exit code {}\n",
+                    member.name,
+                    status.code().unwrap_or(1)
+                );
+                failed = true;
+            } else {
+                println!("\x1b[32m✓\x1b[0m \x1b[1m{}\x1b[0m completed\n", member.name);
+            }
+        }
+
+        if failed {
+            std::process::exit(1);
+        }
+
+        Ok(())
+    }
+
+    /// List all workspaces
+    pub async fn list_workspaces(&self) -> Result<()> {
+        let root = std::env::current_dir()?;
+        let workspace = Workspace::discover(&root)
+            .await?
+            .context("Not in a workspace root")?;
+
+        workspace.print_info();
+        Ok(())
+    }
+
     pub async fn install(&self) -> Result<()> {
+        let root = std::env::current_dir()?;
+        
+        // Check if this is a workspace
+        if let Some(workspace) = Workspace::discover(&root).await? {
+            return self.install_workspace(&workspace).await;
+        }
+
         self.load_lockfile().await?;
         let package_json_content = fs::read_to_string("package.json").await?;
         let package_json: PackageJson = serde_json::from_str(&package_json_content)?;
@@ -1248,6 +1396,119 @@ impl Manager {
 
         self.run_postinstalls().await?;
         self.save_lockfile(&package_json.name, &package_json.version)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Install dependencies for a workspace (monorepo)
+    async fn install_workspace(&self, workspace: &Workspace) -> Result<()> {
+        workspace.print_info();
+        println!();
+
+        self.load_lockfile().await?;
+
+        // Reset and setup progress tracking
+        self.reset_progress();
+        let pb = self.create_install_progress();
+        pb.set_message("\x1b[1mResolving\x1b[0m workspace dependencies...");
+        *self.progress_bar.lock().await = Some(pb.clone());
+
+        // Get hoisted dependencies (installed at root)
+        let hoisted = workspace.get_hoisted_dependencies();
+        let workspace_packages = workspace.get_workspace_package_names();
+
+        // Install hoisted dependencies at root
+        let mut tasks = FuturesUnordered::new();
+        for (name, version) in &hoisted {
+            let root = workspace.root.clone();
+            let manager = self.clone();
+            let name = name.clone();
+            let version = version.clone();
+            tasks.push(async move { manager.resolve_and_install(name, version, root).await });
+        }
+
+        while let Some(result) = tasks.next().await {
+            if let Err(e) = result {
+                let _ = self
+                    .multi_progress
+                    .println(format!("\x1b[31merror:\x1b[0m {}", e));
+            }
+        }
+
+        // Create symlinks for workspace packages in root node_modules
+        let root_node_modules = workspace.root.join("node_modules");
+        fs::create_dir_all(&root_node_modules).await?;
+
+        for member in &workspace.members {
+            let link_path = root_node_modules.join(&member.name);
+            
+            // Handle scoped packages (@scope/name)
+            if member.name.contains('/') {
+                if let Some(scope) = member.name.split('/').next() {
+                    fs::create_dir_all(root_node_modules.join(scope)).await?;
+                }
+            }
+
+            // Remove existing link/dir
+            if link_path.exists() || link_path.is_symlink() {
+                let _ = fs::remove_file(&link_path).await;
+                let _ = fs::remove_dir_all(&link_path).await;
+            }
+
+            // Create symlink to workspace member
+            #[cfg(unix)]
+            {
+                let relative = pathdiff::diff_paths(&member.path, &root_node_modules)
+                    .unwrap_or_else(|| member.path.clone());
+                let _ = fs::symlink(&relative, &link_path).await;
+            }
+
+            #[cfg(windows)]
+            {
+                let _ = tokio::fs::symlink_dir(&member.path, &link_path).await;
+            }
+        }
+
+        // Link binaries from workspace packages
+        for member in &workspace.members {
+            if let Some(bin) = &member.package_json.bin {
+                let _ = self.link_binaries(&workspace.root, &member.name, bin).await;
+            }
+        }
+
+        let installed = self.packages_installed.load(Ordering::Relaxed);
+        let cached = self.packages_cached.load(Ordering::Relaxed);
+
+        pb.finish_and_clear();
+        *self.progress_bar.lock().await = None;
+
+        // Print summary
+        println!();
+        if installed > 0 || cached > 0 {
+            let mut parts = Vec::new();
+            if installed > 0 {
+                parts.push(format!("\x1b[32m+{}\x1b[0m installed", installed));
+            }
+            if cached > 0 {
+                parts.push(format!("\x1b[33m{}\x1b[0m cached", cached));
+            }
+            parts.push(format!(
+                "\x1b[36m{}\x1b[0m linked",
+                workspace_packages.len()
+            ));
+            println!("{}", parts.join("  \x1b[90m│\x1b[0m  "));
+        } else if !workspace_packages.is_empty() {
+            println!(
+                "\x1b[36m{}\x1b[0m workspace packages linked",
+                workspace_packages.len()
+            );
+        } else {
+            println!("\x1b[90mNo packages to install\x1b[0m");
+        }
+
+        self.run_postinstalls().await?;
+        self.save_lockfile(&workspace.root_package.name, &workspace.root_package.version)
             .await?;
 
         Ok(())
