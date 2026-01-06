@@ -24,6 +24,7 @@ RPM currently supports:
 - [x] `npm outdated` equivalent command
 - [x] `npm list` / `npm ls` equivalent command
 - [x] `npm dedupe` equivalent command
+> **Warning** Update command will upgrade all packages to latest version. Like the newest. So if you're on v3 in a libary it will upgrade to v4. It's not the way. Please use with care.
 
 ### Versioning
 - [x] Support for `~` version ranges (patch-level changes)
@@ -39,6 +40,7 @@ RPM currently supports:
 - [x] `workspaces` field in `package.json`
 - [x] Hoisting shared dependencies
 - [x] Running scripts across workspaces
+> **Warning** There is bugs with the workspace feature at this moment. It is pnpm compatible, but with issues where node_modules dont exist after install and lockfile never written.
 
 ## Medium-term Goals
 
@@ -60,17 +62,18 @@ RPM currently supports:
 - [ ] Proxy support
 
 ### Compatibility
-- [ ] `package-lock.json` reading (npm lockfile)
-- [ ] `yarn.lock` reading
-- [ ] `pnpm-lock.yaml` reading
+- [ ] `package-lock.json` reading/migration
+- [ ] `yarn.lock` reading/migration
+- [ ] `pnpm-lock.yaml` reading/migration
+- [ ] `bun.lock` reading/migration
 - [ ] Lifecycle scripts (`preinstall`, `prepare`, `prepublish`, etc.)
 
 ## Long-term Goals
 
 ### Performance
-- [ ] Parallel script execution
-- [ ] Lazy dependency resolution
-- [ ] Incremental installs
+- [x] Parallel script execution
+- [x] Lazy dependency resolution
+- [x] Incremental installs
 - [x] Hard linking for duplicate packages
 
 ### Advanced Features

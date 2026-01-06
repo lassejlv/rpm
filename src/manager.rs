@@ -1234,7 +1234,7 @@ impl Manager {
         Ok(())
     }
 
-    /// Run a script across all workspaces that have it defined
+    /// Run a script across all workspaces that have it defined (in parallel)
     pub async fn run_script_workspaces(
         &self,
         script_name: &str,
@@ -1278,65 +1278,106 @@ impl Manager {
         }
 
         println!(
-            "\x1b[1;36mRunning '{}' in {} workspace(s)\x1b[0m\n",
+            "\x1b[1;36mRunning '{}' in {} workspace(s) (parallel)\x1b[0m\n",
             script_name,
             scripts_to_run.len()
         );
 
         let root_bin_path = workspace.root.join("node_modules").join(".bin");
         let path_env = std::env::var("PATH").unwrap_or_default();
-        let mut failed = false;
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let multi_progress = &self.multi_progress;
 
+        // Execute all scripts in parallel
+        let mut tasks = FuturesUnordered::new();
+        
         for (member, script) in scripts_to_run {
-            let relative_path = member
-                .path
-                .strip_prefix(&workspace.root)
-                .unwrap_or(&member.path);
+            let root_bin_path = root_bin_path.clone();
+            let path_env = path_env.clone();
+            let args = args.clone();
+            let failed = failed.clone();
+            let workspace_root = workspace.root.clone();
+            
+            tasks.push(async move {
+                let relative_path = member
+                    .path
+                    .strip_prefix(&workspace_root)
+                    .unwrap_or(&member.path);
 
-            println!(
-                "\x1b[1;36m{}\x1b[0m \x1b[90m({})\x1b[0m",
-                member.name,
-                relative_path.display()
-            );
-            println!("\x1b[90m$\x1b[0m {}\n", script);
+                // Build the full command with args
+                let full_command = if args.is_empty() {
+                    script.clone()
+                } else {
+                    format!("{} {}", script, args.join(" "))
+                };
 
-            // Build the full command with args
-            let full_command = if args.is_empty() {
-                script.clone()
-            } else {
-                format!("{} {}", script, args.join(" "))
-            };
-
-            // Add both workspace's node_modules/.bin and root node_modules/.bin to PATH
-            let local_bin_path = member.path.join("node_modules").join(".bin");
-            let new_path = format!(
-                "{}:{}:{}",
-                local_bin_path.display(),
-                root_bin_path.display(),
-                path_env
-            );
-
-            let status = Command::new("sh")
-                .arg("-c")
-                .arg(&full_command)
-                .current_dir(&member.path)
-                .env("PATH", &new_path)
-                .status()
-                .await?;
-
-            if !status.success() {
-                println!(
-                    "\x1b[31m✗\x1b[0m \x1b[1m{}\x1b[0m failed with exit code {}\n",
-                    member.name,
-                    status.code().unwrap_or(1)
+                // Add both workspace's node_modules/.bin and root node_modules/.bin to PATH
+                let local_bin_path = member.path.join("node_modules").join(".bin");
+                let new_path = format!(
+                    "{}:{}:{}",
+                    local_bin_path.display(),
+                    root_bin_path.display(),
+                    path_env
                 );
-                failed = true;
+
+                let status = Command::new("sh")
+                    .arg("-c")
+                    .arg(&full_command)
+                    .current_dir(&member.path)
+                    .env("PATH", &new_path)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .output()
+                    .await;
+
+                let (success, output, stderr) = match status {
+                    Ok(output) => (
+                        output.status.success(),
+                        String::from_utf8_lossy(&output.stdout).to_string(),
+                        String::from_utf8_lossy(&output.stderr).to_string(),
+                    ),
+                    Err(e) => (false, String::new(), e.to_string()),
+                };
+
+                if !success {
+                    failed.store(true, Ordering::Relaxed);
+                }
+
+                (member.name.clone(), relative_path.to_path_buf(), script, success, output, stderr)
+            });
+        }
+
+        // Collect results and print them as they complete
+        while let Some((name, relative_path, script, success, output, stderr)) = tasks.next().await {
+            let _ = multi_progress.println(format!(
+                "\x1b[1;36m{}\x1b[0m \x1b[90m({})\x1b[0m",
+                name,
+                relative_path.display()
+            ));
+            let _ = multi_progress.println(format!("\x1b[90m$\x1b[0m {}", script));
+            
+            if !output.is_empty() {
+                for line in output.lines() {
+                    let _ = multi_progress.println(format!("  {}", line));
+                }
+            }
+            if !stderr.is_empty() {
+                for line in stderr.lines() {
+                    let _ = multi_progress.println(format!("  \x1b[90m{}\x1b[0m", line));
+                }
+            }
+
+            if !success {
+                let _ = multi_progress.println(format!(
+                    "\x1b[31m✗\x1b[0m \x1b[1m{}\x1b[0m failed\n",
+                    name
+                ));
             } else {
-                println!("\x1b[32m✓\x1b[0m \x1b[1m{}\x1b[0m completed\n", member.name);
+                let _ = multi_progress.println(format!("\x1b[32m✓\x1b[0m \x1b[1m{}\x1b[0m completed\n", name));
             }
         }
 
-        if failed {
+        if failed.load(Ordering::Relaxed) {
             std::process::exit(1);
         }
 
@@ -1354,6 +1395,71 @@ impl Manager {
         Ok(())
     }
 
+    /// Check if a package in node_modules matches what's expected in the lockfile
+    async fn is_package_up_to_date(&self, name: &str, expected_version: &str) -> bool {
+        let pkg_json_path = std::env::current_dir()
+            .ok()
+            .map(|p| p.join("node_modules").join(name).join("package.json"));
+        
+        if let Some(path) = pkg_json_path {
+            if let Ok(content) = fs::read_to_string(&path).await {
+                if let Ok(pkg) = serde_json::from_str::<PackageJson>(&content) {
+                    return pkg.version == expected_version;
+                }
+            }
+        }
+        false
+    }
+
+    /// Compute which packages need to be installed (incremental install optimization)
+    async fn compute_packages_to_install(&self, package_json: &PackageJson) -> Vec<(String, String)> {
+        let lockfile = self.lockfile.lock().await;
+        
+        // Collect all declared dependencies
+        let all_deps: Vec<(String, String)> = package_json
+            .dependencies
+            .iter()
+            .chain(package_json.dev_dependencies.iter())
+            .map(|(name, version)| (name.clone(), version.clone()))
+            .collect();
+        
+        drop(lockfile);
+        
+        // Check which packages are already up-to-date in node_modules
+        let mut packages_to_install = Vec::new();
+        let mut up_to_date_count = 0;
+        
+        for (name, version_range) in all_deps {
+            // Get expected version from lockfile
+            let expected_version = {
+                let lock = self.lockfile.lock().await;
+                let key = format!("node_modules/{}", name);
+                lock.packages.get(&key).map(|e| e.version.clone())
+            };
+            
+            if let Some(expected) = expected_version {
+                // Check if the installed version matches the lockfile
+                if self.is_package_up_to_date(&name, &expected).await {
+                    up_to_date_count += 1;
+                    // Mark as already processed to skip in resolve_and_install
+                    self.installed.insert(name.clone(), expected);
+                    continue;
+                }
+            }
+            
+            packages_to_install.push((name, version_range));
+        }
+        
+        if up_to_date_count > 0 {
+            let _ = self.multi_progress.println(format!(
+                "\x1b[90m{} packages already up-to-date\x1b[0m",
+                up_to_date_count
+            ));
+        }
+        
+        packages_to_install
+    }
+
     pub async fn install(&self) -> Result<()> {
         let root = std::env::current_dir()?;
         
@@ -1369,10 +1475,26 @@ impl Manager {
         // Reset and setup progress tracking
         self.reset_progress();
         let pb = self.create_install_progress();
-        pb.set_message("\x1b[1mResolving\x1b[0m dependencies...");
+        pb.set_message("\x1b[1mChecking\x1b[0m installed packages...");
         *self.progress_bar.lock().await = Some(pb.clone());
 
-        self.install_deps(&package_json).await?;
+        // Incremental install: compute which packages actually need to be installed
+        let packages_to_install = self.compute_packages_to_install(&package_json).await;
+        
+        if packages_to_install.is_empty() {
+            pb.finish_and_clear();
+            *self.progress_bar.lock().await = None;
+            println!("\x1b[32m✓\x1b[0m All packages up-to-date");
+            return Ok(());
+        }
+
+        pb.set_message(format!(
+            "\x1b[1mInstalling\x1b[0m {} package(s)...",
+            packages_to_install.len()
+        ));
+
+        // Install only packages that need updating
+        self.install_deps_incremental(&package_json, packages_to_install).await?;
 
         let installed = self.packages_installed.load(Ordering::Relaxed);
         let cached = self.packages_cached.load(Ordering::Relaxed);
@@ -1516,8 +1638,7 @@ impl Manager {
 
     async fn install_deps(&self, package_json: &PackageJson) -> Result<()> {
         let root = std::env::current_dir()?;
-        let mut tasks = FuturesUnordered::new();
-
+        
         // Collect all dependencies (regular + dev)
         let all_deps: Vec<(String, String)> = package_json
             .dependencies
@@ -1526,7 +1647,102 @@ impl Manager {
             .map(|(name, version)| (name.clone(), version.clone()))
             .collect();
 
-        for (name, version) in all_deps {
+        // Lazy resolution optimization: identify which packages need registry fetch
+        // vs which can be resolved entirely from lockfile
+        let lockfile = self.lockfile.lock().await;
+        let mut needs_fetch: Vec<(String, String)> = Vec::new();
+        let mut from_lockfile: Vec<(String, String)> = Vec::new();
+        
+        for (name, version_range) in &all_deps {
+            let key = format!("node_modules/{}", name);
+            if let Some(entry) = lockfile.packages.get(&key) {
+                let matches = semver::Version::parse(&entry.version)
+                    .ok()
+                    .and_then(|v| {
+                        semver::VersionReq::parse(version_range)
+                            .ok()
+                            .map(|r| r.matches(&v))
+                    })
+                    .unwrap_or(false);
+                
+                if matches || version_range == &entry.version {
+                    from_lockfile.push((name.clone(), version_range.clone()));
+                } else {
+                    needs_fetch.push((name.clone(), version_range.clone()));
+                }
+            } else {
+                needs_fetch.push((name.clone(), version_range.clone()));
+            }
+        }
+        drop(lockfile);
+
+        // Combine all deps (lockfile-resolvable first for lazy optimization)
+        let ordered_deps: Vec<(String, String)> = from_lockfile
+            .into_iter()
+            .chain(needs_fetch.into_iter())
+            .collect();
+
+        let mut tasks = FuturesUnordered::new();
+        for (name, version) in ordered_deps {
+            let root = root.clone();
+            let manager = self.clone();
+            tasks.push(async move { manager.resolve_and_install(name, version, root).await });
+        }
+
+        while let Some(result) = tasks.next().await {
+            if let Err(e) = result {
+                let _ = self
+                    .multi_progress
+                    .println(format!("\x1b[31merror:\x1b[0m {}", e));
+            }
+        }
+        Ok(())
+    }
+
+    /// Install only the specified packages (incremental install)
+    async fn install_deps_incremental(
+        &self,
+        _package_json: &PackageJson,
+        packages_to_install: Vec<(String, String)>,
+    ) -> Result<()> {
+        let root = std::env::current_dir()?;
+
+        // Lazy resolution: identify which packages need registry fetch
+        let lockfile = self.lockfile.lock().await;
+        let mut needs_fetch: Vec<(String, String)> = Vec::new();
+        let mut from_lockfile: Vec<(String, String)> = Vec::new();
+        
+        for (name, version_range) in &packages_to_install {
+            let key = format!("node_modules/{}", name);
+            if let Some(entry) = lockfile.packages.get(&key) {
+                let matches = semver::Version::parse(&entry.version)
+                    .ok()
+                    .and_then(|v| {
+                        semver::VersionReq::parse(version_range)
+                            .ok()
+                            .map(|r| r.matches(&v))
+                    })
+                    .unwrap_or(false);
+                
+                if matches || version_range == &entry.version {
+                    from_lockfile.push((name.clone(), version_range.clone()));
+                } else {
+                    needs_fetch.push((name.clone(), version_range.clone()));
+                }
+            } else {
+                needs_fetch.push((name.clone(), version_range.clone()));
+            }
+        }
+        drop(lockfile);
+
+        // Process lockfile-resolvable packages first, then those needing fetch
+        let ordered_deps: Vec<(String, String)> = from_lockfile
+            .into_iter()
+            .chain(needs_fetch.into_iter())
+            .collect();
+
+        let mut tasks = FuturesUnordered::new();
+        for (name, version) in ordered_deps {
             let root = root.clone();
             let manager = self.clone();
             tasks.push(async move { manager.resolve_and_install(name, version, root).await });
@@ -1583,38 +1799,84 @@ impl Manager {
             return Ok(());
         }
 
+        let total = scripts_to_run.len();
+        let completed = Arc::new(AtomicUsize::new(0));
+        
         let pb = self
             .multi_progress
-            .add(ProgressBar::new(scripts_to_run.len() as u64));
+            .add(ProgressBar::new(total as u64));
         pb.set_style(ProgressStyle::default_bar()
-            .template("{spinner:.cyan} [{bar:40.cyan/blue}] {pos}/{len} \x1b[1mRunning\x1b[0m postinstall scripts...")
+            .template("{spinner:.cyan} [{bar:40.cyan/blue}] {pos}/{len} \x1b[1mRunning\x1b[0m postinstall scripts (parallel)...")
             .unwrap()
             .progress_chars("━╸─")
             .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"));
 
+        // Execute postinstall scripts in parallel
+        let mut tasks = FuturesUnordered::new();
+        
+        // Limit concurrent postinstall scripts to avoid overwhelming the system
+        let postinstall_semaphore = Arc::new(Semaphore::new(10));
+        
         for (name, (path, script)) in scripts_to_run {
-            pb.set_message(format!("Running postinstall for {}", name));
-
-            let status = Command::new("sh")
-                .arg("-c")
-                .arg(&script)
-                .current_dir(&path)
-                .status()
-                .await;
-
-            if status.is_err() && cfg!(windows) {
-                let _ = Command::new("cmd")
-                    .arg("/C")
+            let completed = completed.clone();
+            let postinstall_semaphore = postinstall_semaphore.clone();
+            
+            tasks.push(async move {
+                let _permit = postinstall_semaphore.acquire().await;
+                
+                let status = Command::new("sh")
+                    .arg("-c")
                     .arg(&script)
                     .current_dir(&path)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
                     .status()
                     .await;
-            }
 
+                // Fallback to cmd on Windows if sh fails
+                let success = match status {
+                    Ok(s) => s.success(),
+                    Err(_) if cfg!(windows) => {
+                        Command::new("cmd")
+                            .arg("/C")
+                            .arg(&script)
+                            .current_dir(&path)
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status()
+                            .await
+                            .map(|s| s.success())
+                            .unwrap_or(false)
+                    }
+                    Err(_) => false,
+                };
+
+                completed.fetch_add(1, Ordering::Relaxed);
+                (name, success)
+            });
+        }
+
+        // Process results as they complete
+        let mut failed_scripts = Vec::new();
+        while let Some((name, success)) = tasks.next().await {
             pb.inc(1);
+            if !success {
+                failed_scripts.push(name);
+            }
         }
 
         pb.finish_and_clear();
+        
+        // Report any failures
+        if !failed_scripts.is_empty() {
+            for name in &failed_scripts {
+                let _ = self.multi_progress.println(format!(
+                    "\x1b[33mwarn:\x1b[0m postinstall script for \x1b[1m{}\x1b[0m failed",
+                    name
+                ));
+            }
+        }
+        
         Ok(())
     }
 
@@ -1705,6 +1967,7 @@ impl Manager {
             return Ok(());
         }
 
+        // Lazy resolution: First check lockfile, then check if already installed on disk
         let lock_entry = {
             let lock = self.lockfile.lock().await;
             let key = format!("node_modules/{}", name);
@@ -1713,6 +1976,7 @@ impl Manager {
 
         let (version, tarball, deps, peer_deps, optional_deps, postinstall, bin) =
             if let Some(entry) = lock_entry {
+                // Check if lockfile version satisfies the requested range
                 let matches = semver::Version::parse(&entry.version)
                     .ok()
                     .and_then(|v| {
@@ -1723,6 +1987,7 @@ impl Manager {
                     .unwrap_or(false);
 
                 if matches || version_range == entry.version {
+                    // Lockfile entry is valid - use it without any network request (lazy)
                     (
                         entry.version,
                         entry.resolved,
@@ -1733,9 +1998,11 @@ impl Manager {
                         entry.bin,
                     )
                 } else {
+                    // Version mismatch - need to fetch from registry
                     self.fetch_and_resolve(&name, &version_range).await?
                 }
             } else {
+                // Not in lockfile - need to fetch from registry
                 self.fetch_and_resolve(&name, &version_range).await?
             };
 
