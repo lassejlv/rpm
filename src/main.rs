@@ -1,11 +1,13 @@
 mod installer;
 mod manager;
+mod output;
 mod registry;
 mod types;
 mod workspace;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use manager::Manager;
+use output::{colors, format_duration};
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -160,12 +162,19 @@ async fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("\x1b[1;31merror:\x1b[0m {}", e);
+        eprintln!(
+            "{}error:{} {}",
+            colors::BOLD_RED,
+            colors::RESET,
+            e
+        );
         std::process::exit(1);
     }
 
     println!(
-        "\n\x1b[1;32mDone\x1b[0m in {:.2}s",
-        start.elapsed().as_secs_f64()
+        "\n{}Done{} in {}",
+        colors::BOLD_GREEN,
+        colors::RESET,
+        format_duration(start.elapsed().as_secs_f64())
     );
 }

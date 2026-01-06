@@ -1,5 +1,6 @@
 use crate::installer::Installer;
-use crate::registry::Registry;
+use crate::output::{colors, RpmError};
+use crate::registry::{parse_package_alias, Registry};
 use crate::types::{LockFile, LockPackage, PackageJson, RegistryVersion};
 use crate::workspace::Workspace;
 use anyhow::{Context, Result};
@@ -102,6 +103,9 @@ pub struct Manager {
     packages_resolved: Arc<AtomicUsize>,
     packages_cached: Arc<AtomicUsize>,
     progress_bar: Arc<tokio::sync::Mutex<Option<ProgressBar>>>,
+    // Track currently processing packages for better progress display
+    current_packages: Arc<DashMap<String, String>>, // name -> status ("resolving", "installing")
+    install_start_time: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 impl Manager {
@@ -125,6 +129,8 @@ impl Manager {
             packages_resolved: Arc::new(AtomicUsize::new(0)),
             packages_cached: Arc::new(AtomicUsize::new(0)),
             progress_bar: Arc::new(tokio::sync::Mutex::new(None)),
+            current_packages: Arc::new(DashMap::new()),
+            install_start_time: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -157,23 +163,69 @@ impl Manager {
         let resolved = self.packages_resolved.load(Ordering::Relaxed);
         let cached = self.packages_cached.load(Ordering::Relaxed);
 
-        let msg = if cached > 0 {
-            format!(
-                "\x1b[1mResolving\x1b[0m \x1b[36m{}\x1b[0m packages  \x1b[90m│\x1b[0m  \x1b[1mInstalling\x1b[0m \x1b[32m{}\x1b[0m  \x1b[90m│\x1b[0m  \x1b[90mCached\x1b[0m \x1b[33m{}\x1b[0m",
-                resolved, installed, cached
-            )
-        } else {
-            format!(
-                "\x1b[1mResolving\x1b[0m \x1b[36m{}\x1b[0m packages  \x1b[90m│\x1b[0m  \x1b[1mInstalling\x1b[0m \x1b[32m{}\x1b[0m",
-                resolved, installed
-            )
-        };
+        // Get current package being processed (most recent one)
+        let current_pkg: Option<String> = self
+            .current_packages
+            .iter()
+            .next()
+            .map(|e| format!("{} {}", e.value(), e.key()));
+
+        let mut msg = format!(
+            "{}Resolved{} {}{}{} {}│{}  {}Installed{} {}{}{}",
+            colors::BOLD,
+            colors::RESET,
+            colors::CYAN,
+            resolved,
+            colors::RESET,
+            colors::GRAY,
+            colors::RESET,
+            colors::BOLD,
+            colors::RESET,
+            colors::GREEN,
+            installed,
+            colors::RESET
+        );
+
+        if cached > 0 {
+            msg.push_str(&format!(
+                "  {}│{}  {}Cached{} {}{}{}",
+                colors::GRAY,
+                colors::RESET,
+                colors::GRAY,
+                colors::RESET,
+                colors::YELLOW,
+                cached,
+                colors::RESET
+            ));
+        }
+
+        // Show current package if available
+        if let Some(pkg) = current_pkg {
+            msg.push_str(&format!(
+                "  {}│{}  {}{}{}",
+                colors::GRAY,
+                colors::RESET,
+                colors::GRAY,
+                pkg,
+                colors::RESET
+            ));
+        }
 
         if let Ok(guard) = self.progress_bar.try_lock() {
             if let Some(pb) = guard.as_ref() {
                 pb.set_message(msg);
             }
         }
+    }
+
+    /// Mark a package as currently being processed
+    fn set_current_package(&self, name: &str, status: &str) {
+        self.current_packages.insert(name.to_string(), status.to_string());
+    }
+
+    /// Remove a package from the current processing list
+    fn clear_current_package(&self, name: &str) {
+        self.current_packages.remove(name);
     }
 
     fn reset_progress(&self) {
@@ -1185,27 +1237,26 @@ impl Manager {
         let package_json_content = fs::read_to_string("package.json").await?;
         let package_json: PackageJson = serde_json::from_str(&package_json_content)?;
 
-        let script = package_json.scripts.get(script_name).with_context(|| {
-            let available: Vec<_> = package_json.scripts.keys().collect();
-            if available.is_empty() {
-                format!(
-                    "Script '{}' not found. No scripts defined in package.json",
-                    script_name
-                )
-            } else {
-                format!(
-                    "Script '{}' not found. Available scripts: {}",
-                    script_name,
-                    available
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
+        let script = match package_json.scripts.get(script_name) {
+            Some(s) => s,
+            None => {
+                let available: Vec<String> = package_json.scripts.keys().cloned().collect();
+                return Err(RpmError::ScriptNotFound {
+                    script: script_name.to_string(),
+                    available,
+                }
+                .into());
             }
-        })?;
+        };
 
-        println!("\x1b[90m$\x1b[0m \x1b[1m{}\x1b[0m\n", script);
+        println!(
+            "{}${} {}{}{}\n",
+            colors::GRAY,
+            colors::RESET,
+            colors::BOLD,
+            script,
+            colors::RESET
+        );
 
         // Build the full command with args
         let full_command = if args.is_empty() {
@@ -1967,6 +2018,9 @@ impl Manager {
             return Ok(());
         }
 
+        // Track current package being resolved
+        self.set_current_package(&name, "resolving");
+
         // Lazy resolution: First check lockfile, then check if already installed on disk
         let lock_entry = {
             let lock = self.lockfile.lock().await;
@@ -2008,6 +2062,7 @@ impl Manager {
 
         // Track resolved packages
         self.packages_resolved.fetch_add(1, Ordering::Relaxed);
+        self.clear_current_package(&name);
         self.update_progress();
 
         if self.installed.contains_key(&name) {
@@ -2019,6 +2074,9 @@ impl Manager {
         let already_exists = install_path.join("package.json").exists();
 
         if !already_exists {
+            // Track current package being installed
+            self.set_current_package(&name, "installing");
+            
             let install_res = async {
                 let install_dir = std::env::current_dir().unwrap();
                 self.installer
@@ -2026,6 +2084,8 @@ impl Manager {
                     .await
             }
             .await;
+
+            self.clear_current_package(&name);
 
             match install_res {
                 Ok(_) => {
@@ -2041,8 +2101,14 @@ impl Manager {
                 }
                 Err(e) => {
                     let _ = self.multi_progress.println(format!(
-                        "\x1b[31m✗\x1b[0m \x1b[1m{}\x1b[0m@{} failed: {}",
-                        name, version, e
+                        "{}✗{} {}{}{}@{} failed: {}",
+                        colors::RED,
+                        colors::RESET,
+                        colors::BOLD,
+                        name,
+                        colors::RESET,
+                        version,
+                        e
                     ));
                     return Err(e);
                 }
@@ -2148,8 +2214,15 @@ impl Manager {
 
     /// Check if an optional dependency is compatible with the current platform
     async fn check_optional_dep_compatible(&self, name: &str, range: &str) -> Result<bool> {
-        let package = self.registry.get_package(name).await?;
-        let resolved = self.registry.resolve_version(&package, range)?;
+        // Handle package aliases (e.g., "npm:@babel/traverse@^7.25.3")
+        let (actual_name, actual_range) = if let Some(alias) = parse_package_alias(range) {
+            (alias.actual_name, alias.version_range)
+        } else {
+            (name.to_string(), range.to_string())
+        };
+        
+        let package = self.registry.get_package(&actual_name).await?;
+        let resolved = self.registry.resolve_version(&package, &actual_range)?;
         Ok(is_version_platform_compatible(resolved))
     }
 
@@ -2167,8 +2240,16 @@ impl Manager {
         Option<serde_json::Value>,
     )> {
         let _permit = self.semaphore.acquire().await?;
-        let package = self.registry.get_package(name).await?;
-        let resolved = self.registry.resolve_version(&package, range)?;
+        
+        // Handle package aliases (e.g., "npm:@babel/traverse@^7.25.3")
+        let (actual_name, actual_range) = if let Some(alias) = parse_package_alias(range) {
+            (alias.actual_name, alias.version_range)
+        } else {
+            (name.to_string(), range.to_string())
+        };
+        
+        let package = self.registry.get_package(&actual_name).await?;
+        let resolved = self.registry.resolve_version(&package, &actual_range)?;
 
         let postinstall = resolved
             .scripts

@@ -86,8 +86,8 @@ RPM currently supports:
 
 ### Developer Experience
 - [ ] Interactive mode for adding packages
-- [ ] Better error messages with suggestions
-- [ ] Progress reporting improvements
+- [x] Better error messages with suggestions
+- [x] Progress reporting improvements
 - [ ] Offline mode
 
 ## Non-goals

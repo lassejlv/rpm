@@ -14,6 +14,28 @@ where
     Ok(opt.unwrap_or_else(default_version))
 }
 
+/// Deserialize a BTreeMap that might be null in JSON
+fn deserialize_null_default_btreemap<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt: Option<BTreeMap<String, String>> = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
+/// Deserialize a HashMap that might be null in JSON
+fn deserialize_null_default_hashmap<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt: Option<HashMap<String, String>> = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PackageJson {
     pub name: String,
@@ -59,13 +81,21 @@ pub struct RegistryVersion {
     pub _name: String,
     pub version: String,
     pub dist: RegistryDist,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default_btreemap")]
     pub dependencies: BTreeMap<String, String>,
-    #[serde(default, rename = "peerDependencies")]
+    #[serde(
+        default,
+        rename = "peerDependencies",
+        deserialize_with = "deserialize_null_default_btreemap"
+    )]
     pub peer_dependencies: BTreeMap<String, String>,
-    #[serde(default, rename = "optionalDependencies")]
+    #[serde(
+        default,
+        rename = "optionalDependencies",
+        deserialize_with = "deserialize_null_default_btreemap"
+    )]
     pub optional_dependencies: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default_hashmap")]
     pub scripts: HashMap<String, String>,
     #[serde(default)]
     pub bin: Option<Value>,
