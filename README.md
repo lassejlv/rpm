@@ -1,6 +1,7 @@
 # rpm
 
 A simple and fast Rust-based Package Manager for the npm registry. It allows you to install dependencies from `package.json`, add new packages, run scripts, and manage a local cache, serving as a lightweight alternative to npm or yarn.
+> **Warning** rpm lags with perf on windows and some strange issues in install, exec/x and running scripts. Mac and Linux are our main focus right now.
 
 ## Installation
 
