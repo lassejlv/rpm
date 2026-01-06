@@ -5988,8 +5988,8 @@
       "integrity": null
     },
     "node_modules/dotenv": {
-      "version": "16.4.7",
-      "resolved": "https://registry.npmjs.org/dotenv/-/dotenv-16.4.7.tgz",
+      "version": "17.2.3",
+      "resolved": "https://registry.npmjs.org/dotenv/-/dotenv-17.2.3.tgz",
       "integrity": null
     },
     "node_modules/dotenv-expand": {
@@ -9350,8 +9350,8 @@
       "integrity": null
     },
     "node_modules/picomatch": {
-      "version": "2.3.1",
-      "resolved": "https://registry.npmjs.org/picomatch/-/picomatch-2.3.1.tgz",
+      "version": "4.0.3",
+      "resolved": "https://registry.npmjs.org/picomatch/-/picomatch-4.0.3.tgz",
       "integrity": null
     },
     "node_modules/pirates": {

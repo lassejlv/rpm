@@ -21,7 +21,7 @@ pub struct PackageJson {
     pub version: String,
     #[serde(default)]
     pub dependencies: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, alias = "devDependencies", alias = "dev_dependencies")]
     pub dev_dependencies: BTreeMap<String, String>,
     #[serde(default, rename = "peerDependencies")]
     pub peer_dependencies: BTreeMap<String, String>,

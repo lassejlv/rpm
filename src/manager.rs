@@ -1257,10 +1257,16 @@ impl Manager {
         let root = std::env::current_dir()?;
         let mut tasks = FuturesUnordered::new();
 
-        for (name, version) in &package_json.dependencies {
+        // Collect all dependencies (regular + dev)
+        let all_deps: Vec<(String, String)> = package_json
+            .dependencies
+            .iter()
+            .chain(package_json.dev_dependencies.iter())
+            .map(|(name, version)| (name.clone(), version.clone()))
+            .collect();
+
+        for (name, version) in all_deps {
             let root = root.clone();
-            let name = name.clone();
-            let version = version.clone();
             let manager = self.clone();
             tasks.push(async move { manager.resolve_and_install(name, version, root).await });
         }
@@ -1591,7 +1597,10 @@ impl Manager {
             }
 
             // Check platform compatibility before attempting to install
-            match self.check_optional_dep_compatible(&dep_name, &dep_ver).await {
+            match self
+                .check_optional_dep_compatible(&dep_name, &dep_ver)
+                .await
+            {
                 Ok(true) => {
                     let target_dir = target_dir.clone();
                     let _ = self
